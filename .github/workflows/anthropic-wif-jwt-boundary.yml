@@ -12,6 +12,23 @@ on:
         required: true
         type: boolean
         default: false
+      experiment:
+        description: "One-variable WIF boundary experiment"
+        required: true
+        default: "legacy_suite"
+        type: choice
+        options:
+          - legacy_suite
+          - baseline
+          - replay_same_jti
+          - alt_workspace_id
+          - alt_service_account_id
+          - alt_federation_rule_id
+          - alt_organization_id
+          - dummy_workspace_id
+          - dummy_service_account_id
+          - dummy_federation_rule_id
+          - dummy_organization_id
 
 permissions:
   contents: read
@@ -31,12 +48,16 @@ jobs:
       - name: Collect claims and optionally test Anthropic WIF exchange
         env:
           INPUT_AUDIENCE: ${{ inputs.audience }}
+          INPUT_EXPERIMENT: ${{ inputs.experiment }}
           RUN_EXCHANGE: ${{ inputs.run_exchange }}
           ANTHROPIC_ORGANIZATION_ID: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          ANTHROPIC_ALT_ORGANIZATION_ID: ${{ vars.ANTHROPIC_ALT_ORGANIZATION_ID }}
           ANTHROPIC_WORKSPACE_ID: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
           ANTHROPIC_ALT_WORKSPACE_ID: ${{ vars.ANTHROPIC_ALT_WORKSPACE_ID }}
           ANTHROPIC_FEDERATION_RULE_ID: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          ANTHROPIC_ALT_FEDERATION_RULE_ID: ${{ vars.ANTHROPIC_ALT_FEDERATION_RULE_ID }}
           ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          ANTHROPIC_ALT_SERVICE_ACCOUNT_ID: ${{ vars.ANTHROPIC_ALT_SERVICE_ACCOUNT_ID }}
           ANTHROPIC_TEST_MODEL: ${{ vars.ANTHROPIC_TEST_MODEL }}
           H1_HANDLE: cyclopesy
         run: node scripts/anthropic-wif-jwt-boundary.mjs
