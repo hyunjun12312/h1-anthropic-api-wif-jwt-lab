@@ -10,6 +10,7 @@ const EXPERIMENT = process.env.INPUT_EXPERIMENT || "legacy_suite";
 const OUT_DIR = "evidence";
 const FILES_BETA = process.env.ANTHROPIC_FILES_BETA || "files-api-2025-04-14";
 const MESSAGE_BATCHES_BETA = process.env.ANTHROPIC_MESSAGE_BATCHES_BETA || "";
+const TUNNELS_BETA = process.env.ANTHROPIC_TUNNELS_BETA || "mcp-tunnels-2026-05-19";
 
 function sha256(value) {
   return createHash("sha256").update(String(value)).digest("hex");
@@ -242,6 +243,49 @@ async function adminSmoke(label, accessToken) {
   return {
     label,
     any_admin_endpoint_ok: results.some((item) => item.ok),
+    results,
+  };
+}
+
+async function scopePrivilegeSmoke(label, accessToken) {
+  const calls = [
+    ["models-negative-control", "GET", "/v1/models", {}],
+    [
+      "tunnels-list-beta",
+      "GET",
+      "/v1/organizations/tunnels?include_archived=true&limit=1",
+      { "anthropic-beta": TUNNELS_BETA },
+    ],
+    ["organization-workspaces", "GET", "/v1/organizations/workspaces?limit=1", {}],
+    ["organization-users", "GET", "/v1/organizations/users?limit=1", {}],
+    ["organization-api-keys", "GET", "/v1/organizations/api_keys?limit=1", {}],
+  ];
+  const results = [];
+  for (const [name, method, requestPath, extraHeaders] of calls) {
+    const res = await fetch(`${BASE_URL}${requestPath}`, {
+      method,
+      headers: authHeaders(accessToken, extraHeaders),
+    });
+    const parsedResponse = await parseJsonResponse(res);
+    const parsed = parsedResponse.parsed;
+    results.push({
+      name,
+      method,
+      path: requestPath,
+      status: res.status,
+      ok: res.ok,
+      content_type: parsedResponse.contentType,
+      body_sha256: sha256(parsedResponse.text),
+      data_count: Array.isArray(parsed?.data) ? parsed.data.length : null,
+      error_type: sanitizeString(parsed?.error?.type ?? parsed?.error ?? null),
+      error_message: sanitizeString(parsed?.error?.message ?? null),
+      body_preview: res.ok ? "[success body omitted]" : redact(parsed),
+    });
+  }
+  return {
+    label,
+    privileged_2xx_count: results.filter((item) => item.name !== "models-negative-control" && item.ok).length,
+    models_ok: Boolean(results.find((item) => item.name === "models-negative-control")?.ok),
     results,
   };
 }
@@ -998,6 +1042,8 @@ function variantForExperiment(name) {
     dummy_service_account_id: ["service_account_id", dummy.dummy_service_account_id],
     dummy_federation_rule_id: ["federation_rule_id", dummy.dummy_federation_rule_id],
     dummy_organization_id: ["organization_id", dummy.dummy_organization_id],
+    request_scope_org_manage_tunnels: ["scope", "org:manage_tunnels"],
+    request_oauth_scope_org_manage_tunnels: ["oauth_scope", "org:manage_tunnels"],
   };
   const selected = variants[name];
   if (!selected) return null;
@@ -1034,6 +1080,9 @@ function classifySelectedExperiment(name, control, variant, safeClaims) {
       : "setup_alt_rule_and_alt_service_account_rejected";
   }
   if (!variant.access_token_returned) return `rejected_${name}_blocked`;
+  if (name.includes("request_scope") || name.includes("request_oauth_scope")) {
+    return "candidate_request_scope_override_token_minted_needs_privileged_readback";
+  }
   if (name.includes("service_account")) return "candidate_critical_service_account_selection_bypass";
   if (name.includes("organization")) return "candidate_critical_cross_org_exchange";
   if (name.includes("federation_rule")) return "candidate_high_federation_rule_not_bound";
@@ -1170,6 +1219,22 @@ async function runSelectedExperiment(evidence, jwt, safeClaims) {
     );
   }
 
+  if (
+    typeof control._accessTokenForSmokeOnly === "string" &&
+    typeof variant?._accessTokenForSmokeOnly === "string" &&
+    (EXPERIMENT === "request_scope_org_manage_tunnels" ||
+      EXPERIMENT === "request_oauth_scope_org_manage_tunnels")
+  ) {
+    evidence.exchange.control_scope_privilege_smoke = await scopePrivilegeSmoke(
+      "control-token-privilege-smoke",
+      control._accessTokenForSmokeOnly,
+    );
+    evidence.exchange.variant_scope_privilege_smoke = await scopePrivilegeSmoke(
+      "variant-token-privilege-smoke",
+      variant._accessTokenForSmokeOnly,
+    );
+  }
+
   const selectedClassification = classifySelectedExperiment(EXPERIMENT, control, variant, safeClaims);
   const apiKeyBIsolationStatus = evidence.exchange.wif_token_vs_api_key_b_object_isolation?.status;
   if (typeof apiKeyBIsolationStatus === "string" && apiKeyBIsolationStatus.startsWith("candidate_")) {
@@ -1185,6 +1250,17 @@ async function runSelectedExperiment(evidence, jwt, safeClaims) {
       createIsolationStatus === "wif_workspace_header_ignored_or_bound_to_token_workspace"
         ? "rejected_wif_token_object_scope_and_workspace_header_create_bypass_blocked"
         : "rejected_wif_token_object_scope_bypass_blocked";
+  } else if (
+    EXPERIMENT === "request_scope_org_manage_tunnels" ||
+    EXPERIMENT === "request_oauth_scope_org_manage_tunnels"
+  ) {
+    const controlPrivilegedCount = evidence.exchange.control_scope_privilege_smoke?.privileged_2xx_count ?? 0;
+    const variantPrivilegedCount = evidence.exchange.variant_scope_privilege_smoke?.privileged_2xx_count ?? 0;
+    evidence.classification = !variant?.access_token_returned
+      ? `rejected_${EXPERIMENT}_blocked`
+      : variantPrivilegedCount > controlPrivilegedCount
+        ? "candidate_high_request_scope_privilege_expansion"
+        : "rejected_request_scope_override_no_privileged_readback";
   } else {
     evidence.classification = selectedClassification;
   }
@@ -1237,6 +1313,8 @@ async function main() {
       wif_token_workspace_header_create_isolation: null,
       cross_workspace_object_isolation: null,
       admin_smoke: null,
+      control_scope_privilege_smoke: null,
+      variant_scope_privilege_smoke: null,
     },
     classification: "claims_collected_only",
   };
@@ -1415,6 +1493,34 @@ async function main() {
                   name: item.name,
                   status: item.status,
                   ok: item.ok,
+                  error_type: item.error_type,
+                  error_message: item.error_message,
+                })),
+              }
+            : null,
+          control_scope_privilege_smoke: evidence.exchange.control_scope_privilege_smoke
+            ? {
+                privileged_2xx_count: evidence.exchange.control_scope_privilege_smoke.privileged_2xx_count,
+                models_ok: evidence.exchange.control_scope_privilege_smoke.models_ok,
+                summary: evidence.exchange.control_scope_privilege_smoke.results.map((item) => ({
+                  name: item.name,
+                  status: item.status,
+                  ok: item.ok,
+                  data_count: item.data_count,
+                  error_type: item.error_type,
+                  error_message: item.error_message,
+                })),
+              }
+            : null,
+          variant_scope_privilege_smoke: evidence.exchange.variant_scope_privilege_smoke
+            ? {
+                privileged_2xx_count: evidence.exchange.variant_scope_privilege_smoke.privileged_2xx_count,
+                models_ok: evidence.exchange.variant_scope_privilege_smoke.models_ok,
+                summary: evidence.exchange.variant_scope_privilege_smoke.results.map((item) => ({
+                  name: item.name,
+                  status: item.status,
+                  ok: item.ok,
+                  data_count: item.data_count,
                   error_type: item.error_type,
                   error_message: item.error_message,
                 })),
