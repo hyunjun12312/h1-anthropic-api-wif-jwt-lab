@@ -686,6 +686,10 @@ function variantForExperiment(name) {
     alt_workspace_id: ["workspace_id", process.env.ANTHROPIC_ALT_WORKSPACE_ID],
     alt_service_account_id: ["service_account_id", process.env.ANTHROPIC_ALT_SERVICE_ACCOUNT_ID],
     alt_federation_rule_id: ["federation_rule_id", process.env.ANTHROPIC_ALT_FEDERATION_RULE_ID],
+    alt_rule_and_alt_service_account: [
+      ["federation_rule_id", process.env.ANTHROPIC_ALT_FEDERATION_RULE_ID],
+      ["service_account_id", process.env.ANTHROPIC_ALT_SERVICE_ACCOUNT_ID],
+    ],
     alt_organization_id: ["organization_id", process.env.ANTHROPIC_ALT_ORGANIZATION_ID],
     dummy_workspace_id: ["workspace_id", dummy.dummy_workspace_id],
     dummy_service_account_id: ["service_account_id", dummy.dummy_service_account_id],
@@ -694,9 +698,10 @@ function variantForExperiment(name) {
   };
   const selected = variants[name];
   if (!selected) return null;
-  const [field, value] = selected;
-  if (!value) return { missing: field };
-  return { field, overrides: { [field]: value } };
+  const pairs = Array.isArray(selected[0]) ? selected : [selected];
+  const missingPair = pairs.find(([, value]) => !value);
+  if (missingPair) return { missing: missingPair[0] };
+  return { fields: pairs.map(([field]) => field), overrides: Object.fromEntries(pairs) };
 }
 
 function classifySelectedExperiment(name, control, variant, safeClaims) {
@@ -720,6 +725,11 @@ function classifySelectedExperiment(name, control, variant, safeClaims) {
   }
   if (!control.access_token_returned) return "setup_failed_control_exchange_rejected";
   if (!variant) return "baseline_control_exchange_accepted";
+  if (name === "alt_rule_and_alt_service_account") {
+    return variant.access_token_returned
+      ? "baseline_alt_rule_and_alt_service_account_accepted"
+      : "setup_alt_rule_and_alt_service_account_rejected";
+  }
   if (!variant.access_token_returned) return `rejected_${name}_blocked`;
   if (name.includes("service_account")) return "candidate_critical_service_account_selection_bypass";
   if (name.includes("organization")) return "candidate_critical_cross_org_exchange";

@@ -24,6 +24,7 @@ on:
           - alt_workspace_id
           - alt_service_account_id
           - alt_federation_rule_id
+          - alt_rule_and_alt_service_account
           - alt_organization_id
           - dummy_workspace_id
           - dummy_service_account_id
