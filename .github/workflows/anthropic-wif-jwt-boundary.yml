@@ -1,0 +1,48 @@
+name: Anthropic WIF JWT boundary
+
+on:
+  workflow_dispatch:
+    inputs:
+      audience:
+        description: "OIDC audience to request from GitHub"
+        required: true
+        default: "https://api.anthropic.com"
+      run_exchange:
+        description: "Attempt Anthropic WIF token exchange using repository variables"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Collect claims and optionally test Anthropic WIF exchange
+        env:
+          INPUT_AUDIENCE: ${{ inputs.audience }}
+          RUN_EXCHANGE: ${{ inputs.run_exchange }}
+          ANTHROPIC_ORGANIZATION_ID: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          ANTHROPIC_WORKSPACE_ID: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+          ANTHROPIC_FEDERATION_RULE_ID: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          ANTHROPIC_TEST_MODEL: ${{ vars.ANTHROPIC_TEST_MODEL }}
+          H1_HANDLE: cyclopesy
+        run: node scripts/anthropic-wif-jwt-boundary.mjs
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: anthropic-wif-jwt-boundary-evidence
+          path: evidence/
+          if-no-files-found: error
