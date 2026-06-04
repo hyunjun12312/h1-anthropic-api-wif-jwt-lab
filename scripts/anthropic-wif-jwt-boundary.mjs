@@ -531,13 +531,22 @@ async function crossWorkspaceObjectIsolation(label, jwt, accessTokenA) {
     status: bCredential.missing.length ? "skipped_missing_b_credential" : "attempted",
     missing_b_variables: bCredential.missing,
     b_request_body_fingerprint: bCredential.missing.length ? null : fingerprintExchangeOverrides(bCredential.overrides),
+    b_github_oidc: null,
     b_exchange: null,
     file: null,
     batch: null,
   };
   if (bCredential.missing.length) return result;
 
-  const bExchange = await exchange("cross-workspace-b-token", jwt, bCredential.overrides);
+  const bJwt = await getGithubOidc(AUDIENCE);
+  const bDecoded = decodeJwt(bJwt);
+  result.b_github_oidc = {
+    note: "Fresh GitHub OIDC JWT used for the B exchange so workspace-object isolation is not confused with JTI replay protection.",
+    requested_audience: AUDIENCE,
+    jwt_sha256_only: sha256(bJwt),
+    safe_claims: safeClaimsFromDecoded(bDecoded),
+  };
+  const bExchange = await exchange("cross-workspace-b-token", bJwt, bCredential.overrides);
   result.b_exchange = bExchange;
   if (typeof bExchange._accessTokenForSmokeOnly !== "string") {
     result.status = "b_token_not_minted";
