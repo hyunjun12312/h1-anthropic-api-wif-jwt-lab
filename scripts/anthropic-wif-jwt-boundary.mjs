@@ -140,24 +140,40 @@ async function exchange(label, assertion, overrides = {}) {
 }
 
 async function adminSmoke(label, accessToken) {
-  const res = await fetch(`${BASE_URL}/v1/organizations/workspaces`, {
-    method: "GET",
-    headers: {
-      "anthropic-version": VERSION,
-      authorization: `Bearer ${accessToken}`,
-      "x-hackerone-handle": process.env.H1_HANDLE || "cyclopesy",
-    },
-  });
-  const { text, contentType, parsed } = await parseJsonResponse(res);
+  const endpoints = [
+    ["workspaces", "/v1/organizations/workspaces"],
+    ["users", "/v1/organizations/users"],
+    ["invites", "/v1/organizations/invites"],
+    ["api_keys", "/v1/organizations/api_keys"],
+    ["usage_report_messages", "/v1/organizations/usage_report/messages"],
+  ];
+  const results = [];
+  for (const [name, path] of endpoints) {
+    const res = await fetch(`${BASE_URL}${path}`, {
+      method: "GET",
+      headers: {
+        "anthropic-version": VERSION,
+        authorization: `Bearer ${accessToken}`,
+        "x-hackerone-handle": process.env.H1_HANDLE || "cyclopesy",
+      },
+    });
+    const { text, contentType, parsed } = await parseJsonResponse(res);
+    results.push({
+      name,
+      path,
+      status: res.status,
+      ok: res.ok,
+      content_type: contentType,
+      body_sha256: sha256(text),
+      error_type: sanitizeString(parsed?.error?.type ?? parsed?.error ?? null),
+      error_message: sanitizeString(parsed?.error?.message ?? null),
+      body_preview: res.ok ? "[success body omitted]" : redact(parsed),
+    });
+  }
   return {
     label,
-    status: res.status,
-    ok: res.ok,
-    content_type: contentType,
-    body_sha256: sha256(text),
-    error_type: sanitizeString(parsed?.error?.type ?? parsed?.error ?? null),
-    error_message: sanitizeString(parsed?.error?.message ?? null),
-    body_preview: res.ok ? "[success body omitted]" : redact(parsed),
+    any_admin_endpoint_ok: results.some((item) => item.ok),
+    results,
   };
 }
 
@@ -474,10 +490,14 @@ async function main() {
             : null,
           admin_smoke: evidence.exchange.admin_smoke
             ? {
-                status: evidence.exchange.admin_smoke.status,
-                ok: evidence.exchange.admin_smoke.ok,
-                error_type: evidence.exchange.admin_smoke.error_type,
-                error_message: evidence.exchange.admin_smoke.error_message,
+                any_admin_endpoint_ok: evidence.exchange.admin_smoke.any_admin_endpoint_ok,
+                summary: evidence.exchange.admin_smoke.results.map((item) => ({
+                  name: item.name,
+                  status: item.status,
+                  ok: item.ok,
+                  error_type: item.error_type,
+                  error_message: item.error_message,
+                })),
               }
             : null,
         },
