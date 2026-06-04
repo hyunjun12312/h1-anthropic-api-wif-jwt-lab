@@ -66,6 +66,7 @@ jobs:
           ANTHROPIC_TEST_MODEL: ${{ vars.ANTHROPIC_TEST_MODEL }}
           ANTHROPIC_FILES_BETA: ${{ vars.ANTHROPIC_FILES_BETA }}
           ANTHROPIC_MESSAGE_BATCHES_BETA: ${{ vars.ANTHROPIC_MESSAGE_BATCHES_BETA }}
+          ANTHROPIC_API_KEY_B: ${{ secrets.ANTHROPIC_API_KEY_B }}
           H1_HANDLE: cyclopesy
         run: node scripts/anthropic-wif-jwt-boundary.mjs
 
