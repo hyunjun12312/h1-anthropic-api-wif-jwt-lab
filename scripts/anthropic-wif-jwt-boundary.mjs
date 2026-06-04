@@ -696,6 +696,128 @@ async function wifTokenVsApiKeyBObjectIsolation(label, accessTokenA) {
   return result;
 }
 
+async function wifTokenWorkspaceHeaderCreateIsolation(label, accessTokenA) {
+  const apiKeyB = process.env.ANTHROPIC_API_KEY_B;
+  const bSpoofHeaders = {
+    "anthropic-workspace-id": process.env.ANTHROPIC_B_WORKSPACE_ID || "",
+    "x-organization-uuid": process.env.ANTHROPIC_ORGANIZATION_ID || "",
+  };
+  const result = {
+    label,
+    status: apiKeyB ? "attempted" : "skipped_missing_anthropic_api_key_b_secret",
+    b_workspace_header_fingerprint: {
+      organization_id_sha256: process.env.ANTHROPIC_ORGANIZATION_ID ? sha256(process.env.ANTHROPIC_ORGANIZATION_ID) : null,
+      workspace_id_sha256: process.env.ANTHROPIC_B_WORKSPACE_ID ? sha256(process.env.ANTHROPIC_B_WORKSPACE_ID) : null,
+    },
+    file: null,
+    batch: null,
+  };
+  if (!apiKeyB) return result;
+
+  let fileId = null;
+  try {
+    const marker = `H1_WIF_A_CREATE_WITH_B_WORKSPACE_HEADER_${Date.now()}`;
+    const form = new FormData();
+    form.set("purpose", "user_data");
+    form.set("file", new Blob([`${marker}\n`], { type: "text/plain" }), "h1-wif-create-with-b-workspace-header.txt");
+    const createRes = await fetch(`${BASE_URL}/v1/files`, {
+      method: "POST",
+      headers: authHeaders(accessTokenA, { ...maybeBeta(FILES_BETA), ...bSpoofHeaders }),
+      body: form,
+    });
+    const createParsed = await parseJsonResponse(createRes);
+    fileId = typeof createParsed.parsed?.id === "string" ? createParsed.parsed.id : null;
+    result.file = {
+      marker_sha256: sha256(marker),
+      create_with_a_wif_plus_b_workspace_headers: {
+        ...compactHttpResult(createRes, createParsed),
+        file_id_returned: Boolean(fileId),
+        file_id_sha256: fileId ? sha256(fileId) : null,
+      },
+      readback_with_a_wif: fileId ? await getFileMetadata(accessTokenA, fileId) : null,
+      readback_with_b_api_key: fileId
+        ? await getFileMetadataWithHeaders(fileId, apiKeyHeaders(apiKeyB, maybeBeta(FILES_BETA)))
+        : null,
+      cleanup_with_a_wif: null,
+      cleanup_with_b_api_key: null,
+    };
+  } finally {
+    if (fileId && result.file) {
+      const deleteWithA = await fetch(`${BASE_URL}/v1/files/${encodeURIComponent(fileId)}`, {
+        method: "DELETE",
+        headers: authHeaders(accessTokenA, maybeBeta(FILES_BETA)),
+      });
+      result.file.cleanup_with_a_wif = compactHttpResult(deleteWithA, await parseJsonResponse(deleteWithA));
+      if (!result.file.cleanup_with_a_wif.ok) {
+        const deleteWithB = await fetch(`${BASE_URL}/v1/files/${encodeURIComponent(fileId)}`, {
+          method: "DELETE",
+          headers: apiKeyHeaders(apiKeyB, maybeBeta(FILES_BETA)),
+        });
+        result.file.cleanup_with_b_api_key = compactHttpResult(deleteWithB, await parseJsonResponse(deleteWithB));
+      }
+    }
+  }
+
+  let batchId = null;
+  try {
+    const customId = `h1-wif-create-with-b-workspace-header-${Date.now()}`;
+    const createRes = await fetch(`${BASE_URL}/v1/messages/batches`, {
+      method: "POST",
+      headers: authHeaders(accessTokenA, { "content-type": "application/json", ...maybeBeta(MESSAGE_BATCHES_BETA), ...bSpoofHeaders }),
+      body: JSON.stringify({
+        requests: [{
+          custom_id: customId,
+          params: {
+            model: process.env.ANTHROPIC_TEST_MODEL || "claude-haiku-4-5-20251001",
+            max_tokens: 1,
+            messages: [{ role: "user", content: "Reply OK." }],
+          },
+        }],
+      }),
+    });
+    const createParsed = await parseJsonResponse(createRes);
+    batchId = typeof createParsed.parsed?.id === "string" ? createParsed.parsed.id : null;
+    result.batch = {
+      custom_id_sha256: sha256(customId),
+      create_with_a_wif_plus_b_workspace_headers: {
+        ...compactHttpResult(createRes, createParsed),
+        batch_id_returned: Boolean(batchId),
+        batch_id_sha256: batchId ? sha256(batchId) : null,
+      },
+      readback_with_a_wif: batchId ? await getBatchMetadata(accessTokenA, batchId) : null,
+      readback_with_b_api_key: batchId
+        ? await getBatchMetadataWithHeaders(batchId, apiKeyHeaders(apiKeyB, maybeBeta(MESSAGE_BATCHES_BETA)))
+        : null,
+      cleanup_with_a_wif: null,
+      cleanup_with_b_api_key: null,
+    };
+  } finally {
+    if (batchId && result.batch) {
+      const cancelWithA = await fetch(`${BASE_URL}/v1/messages/batches/${encodeURIComponent(batchId)}/cancel`, {
+        method: "POST",
+        headers: authHeaders(accessTokenA, maybeBeta(MESSAGE_BATCHES_BETA)),
+      });
+      result.batch.cleanup_with_a_wif = compactHttpResult(cancelWithA, await parseJsonResponse(cancelWithA));
+      if (!result.batch.cleanup_with_a_wif.ok) {
+        const cancelWithB = await fetch(`${BASE_URL}/v1/messages/batches/${encodeURIComponent(batchId)}/cancel`, {
+          method: "POST",
+          headers: apiKeyHeaders(apiKeyB, maybeBeta(MESSAGE_BATCHES_BETA)),
+        });
+        result.batch.cleanup_with_b_api_key = compactHttpResult(cancelWithB, await parseJsonResponse(cancelWithB));
+      }
+    }
+  }
+
+  const createdVisibleToB = Boolean(result.file?.readback_with_b_api_key?.ok || result.batch?.readback_with_b_api_key?.ok);
+  const createdVisibleToA = Boolean(result.file?.readback_with_a_wif?.ok || result.batch?.readback_with_a_wif?.ok);
+  result.status = createdVisibleToB
+    ? "candidate_high_wif_workspace_header_created_object_in_b_workspace"
+    : createdVisibleToA
+      ? "wif_workspace_header_ignored_or_bound_to_token_workspace"
+      : "wif_workspace_header_create_blocked_or_inconclusive";
+  return result;
+}
+
 async function crossWorkspaceObjectIsolation(label, jwt, accessTokenA) {
   const bCredential = optionalBExchangeVars();
   const result = {
@@ -1033,6 +1155,10 @@ async function runSelectedExperiment(evidence, jwt, safeClaims) {
       "control-a-wif-token-vs-api-key-b-object-isolation",
       control._accessTokenForSmokeOnly,
     );
+    evidence.exchange.wif_token_workspace_header_create_isolation = await wifTokenWorkspaceHeaderCreateIsolation(
+      "control-a-wif-token-create-with-b-workspace-header-isolation",
+      control._accessTokenForSmokeOnly,
+    );
     evidence.exchange.cross_workspace_object_isolation = await crossWorkspaceObjectIsolation(
       "control-a-token-cross-workspace-object-isolation",
       jwt,
@@ -1048,8 +1174,17 @@ async function runSelectedExperiment(evidence, jwt, safeClaims) {
   const apiKeyBIsolationStatus = evidence.exchange.wif_token_vs_api_key_b_object_isolation?.status;
   if (typeof apiKeyBIsolationStatus === "string" && apiKeyBIsolationStatus.startsWith("candidate_")) {
     evidence.classification = apiKeyBIsolationStatus;
+  } else if (
+    typeof evidence.exchange.wif_token_workspace_header_create_isolation?.status === "string" &&
+    evidence.exchange.wif_token_workspace_header_create_isolation.status.startsWith("candidate_")
+  ) {
+    evidence.classification = evidence.exchange.wif_token_workspace_header_create_isolation.status;
   } else if (apiKeyBIsolationStatus === "wif_a_token_blocked_from_api_key_b_objects") {
-    evidence.classification = "rejected_wif_token_object_scope_bypass_blocked";
+    const createIsolationStatus = evidence.exchange.wif_token_workspace_header_create_isolation?.status;
+    evidence.classification =
+      createIsolationStatus === "wif_workspace_header_ignored_or_bound_to_token_workspace"
+        ? "rejected_wif_token_object_scope_and_workspace_header_create_bypass_blocked"
+        : "rejected_wif_token_object_scope_bypass_blocked";
   } else {
     evidence.classification = selectedClassification;
   }
@@ -1099,6 +1234,7 @@ async function main() {
       file_lifecycle_smoke: null,
       batch_lifecycle_smoke: null,
       wif_token_vs_api_key_b_object_isolation: null,
+      wif_token_workspace_header_create_isolation: null,
       cross_workspace_object_isolation: null,
       admin_smoke: null,
     },
@@ -1225,6 +1361,39 @@ async function main() {
                 cross_a_wif_spoofed_batch_metadata_status:
                   evidence.exchange.wif_token_vs_api_key_b_object_isolation.batch
                     ?.cross_a_wif_with_b_workspace_headers_metadata?.status ?? null,
+              }
+            : null,
+          wif_token_workspace_header_create_isolation: evidence.exchange.wif_token_workspace_header_create_isolation
+            ? {
+                status: evidence.exchange.wif_token_workspace_header_create_isolation.status,
+                file_create_status:
+                  evidence.exchange.wif_token_workspace_header_create_isolation.file
+                    ?.create_with_a_wif_plus_b_workspace_headers?.status ?? null,
+                file_create_ok:
+                  evidence.exchange.wif_token_workspace_header_create_isolation.file
+                    ?.create_with_a_wif_plus_b_workspace_headers?.ok ?? null,
+                file_readback_with_a_wif_status:
+                  evidence.exchange.wif_token_workspace_header_create_isolation.file?.readback_with_a_wif?.status ?? null,
+                file_readback_with_a_wif_ok:
+                  evidence.exchange.wif_token_workspace_header_create_isolation.file?.readback_with_a_wif?.ok ?? null,
+                file_readback_with_b_api_key_status:
+                  evidence.exchange.wif_token_workspace_header_create_isolation.file?.readback_with_b_api_key?.status ?? null,
+                file_readback_with_b_api_key_ok:
+                  evidence.exchange.wif_token_workspace_header_create_isolation.file?.readback_with_b_api_key?.ok ?? null,
+                batch_create_status:
+                  evidence.exchange.wif_token_workspace_header_create_isolation.batch
+                    ?.create_with_a_wif_plus_b_workspace_headers?.status ?? null,
+                batch_create_ok:
+                  evidence.exchange.wif_token_workspace_header_create_isolation.batch
+                    ?.create_with_a_wif_plus_b_workspace_headers?.ok ?? null,
+                batch_readback_with_a_wif_status:
+                  evidence.exchange.wif_token_workspace_header_create_isolation.batch?.readback_with_a_wif?.status ?? null,
+                batch_readback_with_a_wif_ok:
+                  evidence.exchange.wif_token_workspace_header_create_isolation.batch?.readback_with_a_wif?.ok ?? null,
+                batch_readback_with_b_api_key_status:
+                  evidence.exchange.wif_token_workspace_header_create_isolation.batch?.readback_with_b_api_key?.status ?? null,
+                batch_readback_with_b_api_key_ok:
+                  evidence.exchange.wif_token_workspace_header_create_isolation.batch?.readback_with_b_api_key?.ok ?? null,
               }
             : null,
           cross_workspace_object_isolation: evidence.exchange.cross_workspace_object_isolation
