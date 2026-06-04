@@ -43,7 +43,8 @@ function sanitizeString(value) {
   return value
     .replace(/sk-ant-[A-Za-z0-9._-]+/g, "[redacted:anthropic-token]")
     .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
-    .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g, "[redacted:jwt]");
+    .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g, "[redacted:jwt]")
+    .replace(/\b(file|msgbatch|msg|wrkspc|org|user|api_key)_[A-Za-z0-9_-]+\b/g, "[redacted:anthropic-id]");
 }
 
 function redact(value) {
@@ -418,6 +419,88 @@ async function fileLifecycleSmoke(label, accessToken) {
   return result;
 }
 
+
+async function getBatchMetadata(accessToken, batchId, extraHeaders = {}) {
+  const res = await fetch(`${BASE_URL}/v1/messages/batches/${encodeURIComponent(batchId)}`, {
+    method: "GET",
+    headers: authHeaders(accessToken, { ...maybeBeta(MESSAGE_BATCHES_BETA), ...extraHeaders }),
+  });
+  return compactHttpResult(res, await parseJsonResponse(res));
+}
+
+async function getBatchResults(accessToken, batchId, extraHeaders = {}) {
+  const res = await fetch(`${BASE_URL}/v1/messages/batches/${encodeURIComponent(batchId)}/results`, {
+    method: "GET",
+    headers: authHeaders(accessToken, { ...maybeBeta(MESSAGE_BATCHES_BETA), ...extraHeaders }),
+  });
+  return compactHttpResult(res, await parseJsonResponse(res));
+}
+
+async function batchLifecycleSmoke(label, accessToken) {
+  const marker = `H1_WIF_BATCH_TOMBSTONE_${Date.now()}`;
+  const customId = `h1-batch-lifecycle-${Date.now()}`;
+  const createRes = await fetch(`${BASE_URL}/v1/messages/batches`, {
+    method: "POST",
+    headers: authHeaders(accessToken, { "content-type": "application/json", ...maybeBeta(MESSAGE_BATCHES_BETA) }),
+    body: JSON.stringify({
+      requests: [{
+        custom_id: customId,
+        params: {
+          model: process.env.ANTHROPIC_TEST_MODEL || "claude-haiku-4-5-20251001",
+          max_tokens: 8,
+          messages: [{ role: "user", content: `Reply exactly: ${marker}` }],
+        },
+      }],
+    }),
+  });
+  const createParsed = await parseJsonResponse(createRes);
+  const batchId = typeof createParsed.parsed?.id === "string" ? createParsed.parsed.id : null;
+  const result = {
+    label,
+    marker_sha256: sha256(marker),
+    custom_id_sha256: sha256(customId),
+    create: {
+      ...compactHttpResult(createRes, createParsed),
+      batch_id_returned: Boolean(batchId),
+      batch_id_sha256: batchId ? sha256(batchId) : null,
+    },
+    pre_cancel_metadata: null,
+    pre_cancel_results: null,
+    cancel: null,
+    post_cancel_metadata: null,
+    post_cancel_results: null,
+    wrong_beta_metadata: null,
+    no_beta_metadata: null,
+    candidate_unexpected_results_access: false,
+  };
+  if (!batchId) return result;
+
+  result.pre_cancel_metadata = await getBatchMetadata(accessToken, batchId);
+  result.pre_cancel_results = await getBatchResults(accessToken, batchId);
+
+  const wrongBetaRes = await fetch(`${BASE_URL}/v1/messages/batches/${encodeURIComponent(batchId)}`, {
+    method: "GET",
+    headers: authHeaders(accessToken, { "anthropic-beta": "files-api-2025-04-14" }),
+  });
+  result.wrong_beta_metadata = compactHttpResult(wrongBetaRes, await parseJsonResponse(wrongBetaRes));
+
+  const noBetaRes = await fetch(`${BASE_URL}/v1/messages/batches/${encodeURIComponent(batchId)}`, {
+    method: "GET",
+    headers: authHeaders(accessToken),
+  });
+  result.no_beta_metadata = compactHttpResult(noBetaRes, await parseJsonResponse(noBetaRes));
+
+  const cancelRes = await fetch(`${BASE_URL}/v1/messages/batches/${encodeURIComponent(batchId)}/cancel`, {
+    method: "POST",
+    headers: authHeaders(accessToken, maybeBeta(MESSAGE_BATCHES_BETA)),
+  });
+  result.cancel = compactHttpResult(cancelRes, await parseJsonResponse(cancelRes));
+  result.post_cancel_metadata = await getBatchMetadata(accessToken, batchId);
+  result.post_cancel_results = await getBatchResults(accessToken, batchId);
+  result.candidate_unexpected_results_access = Boolean(result.post_cancel_results?.ok);
+  return result;
+}
+
 async function crossWorkspaceObjectIsolation(label, jwt, accessTokenA) {
   const bCredential = optionalBExchangeVars();
   const result = {
@@ -720,6 +803,10 @@ async function runSelectedExperiment(evidence, jwt, safeClaims) {
       "control-access-token-file-lifecycle-smoke",
       control._accessTokenForSmokeOnly,
     );
+    evidence.exchange.batch_lifecycle_smoke = await batchLifecycleSmoke(
+      "control-access-token-batch-lifecycle-smoke",
+      control._accessTokenForSmokeOnly,
+    );
     evidence.exchange.cross_workspace_object_isolation = await crossWorkspaceObjectIsolation(
       "control-a-token-cross-workspace-object-isolation",
       jwt,
@@ -795,6 +882,7 @@ async function main() {
       file_smoke: null,
       batch_smoke: null,
       file_lifecycle_smoke: null,
+      batch_lifecycle_smoke: null,
       cross_workspace_object_isolation: null,
       admin_smoke: null,
     },
@@ -872,6 +960,18 @@ async function main() {
                 post_delete_content_status: evidence.exchange.file_lifecycle_smoke.post_delete_content?.status ?? null,
                 post_delete_content_ok: evidence.exchange.file_lifecycle_smoke.post_delete_content?.ok ?? null,
                 candidate_stale_read: evidence.exchange.file_lifecycle_smoke.candidate_stale_read,
+              }
+            : null,
+          batch_lifecycle_smoke: evidence.exchange.batch_lifecycle_smoke
+            ? {
+                create_status: evidence.exchange.batch_lifecycle_smoke.create.status,
+                pre_cancel_metadata_status: evidence.exchange.batch_lifecycle_smoke.pre_cancel_metadata?.status ?? null,
+                pre_cancel_results_status: evidence.exchange.batch_lifecycle_smoke.pre_cancel_results?.status ?? null,
+                cancel_status: evidence.exchange.batch_lifecycle_smoke.cancel?.status ?? null,
+                post_cancel_metadata_status: evidence.exchange.batch_lifecycle_smoke.post_cancel_metadata?.status ?? null,
+                post_cancel_results_status: evidence.exchange.batch_lifecycle_smoke.post_cancel_results?.status ?? null,
+                post_cancel_results_ok: evidence.exchange.batch_lifecycle_smoke.post_cancel_results?.ok ?? null,
+                candidate_unexpected_results_access: evidence.exchange.batch_lifecycle_smoke.candidate_unexpected_results_access,
               }
             : null,
           cross_workspace_object_isolation: evidence.exchange.cross_workspace_object_isolation
