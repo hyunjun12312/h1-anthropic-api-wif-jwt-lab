@@ -309,10 +309,15 @@ async function main() {
         (item) => item.label !== "control-real-github-oidc-jwt" && item.access_token_returned,
       );
       const requestedUnexpectedAudience = AUDIENCE !== "https://api.anthropic.com";
+      const requestedUnexpectedRef = safeClaims.ref !== "refs/heads/master";
       if (requestedUnexpectedAudience && control.access_token_returned) {
         evidence.classification = "candidate_high_real_github_oidc_wrong_audience_accepted";
+      } else if (requestedUnexpectedRef && control.access_token_returned) {
+        evidence.classification = "candidate_high_real_github_oidc_wrong_ref_accepted";
       } else if (requestedUnexpectedAudience && !control.access_token_returned) {
         evidence.classification = "rejected_real_github_oidc_wrong_audience_blocked";
+      } else if (requestedUnexpectedRef && !control.access_token_returned) {
+        evidence.classification = "rejected_real_github_oidc_wrong_ref_blocked";
       } else if (!control.access_token_returned) {
         evidence.classification = "setup_failed_control_exchange_rejected";
       } else if (acceptedBoundaryBypasses.length) {
