@@ -38,6 +38,29 @@ function decodeJwt(jwt) {
   };
 }
 
+function safeClaimsFromDecoded(decoded) {
+  return {
+    iss: decoded.payload.iss,
+    aud: decoded.payload.aud,
+    sub: decoded.payload.sub,
+    repository: decoded.payload.repository,
+    repository_owner: decoded.payload.repository_owner,
+    repository_id: decoded.payload.repository_id,
+    repository_owner_id: decoded.payload.repository_owner_id,
+    ref: decoded.payload.ref,
+    ref_type: decoded.payload.ref_type,
+    sha: decoded.payload.sha,
+    workflow: decoded.payload.workflow,
+    workflow_ref: decoded.payload.workflow_ref,
+    job_workflow_ref: decoded.payload.job_workflow_ref,
+    event_name: decoded.payload.event_name,
+    actor: decoded.payload.actor,
+    actor_id: decoded.payload.actor_id,
+    run_id: decoded.payload.run_id,
+    run_attempt: decoded.payload.run_attempt,
+  };
+}
+
 function sanitizeString(value) {
   if (typeof value !== "string") return value ?? null;
   return value
@@ -781,8 +804,16 @@ async function runSelectedExperiment(evidence, jwt, safeClaims) {
       evidence.classification = `setup_missing_${selected.missing}_for_${EXPERIMENT}`;
       return;
     }
+    const variantJwt = await getGithubOidc(AUDIENCE);
+    const variantDecoded = decodeJwt(variantJwt);
+    evidence.exchange.variant_github_oidc = {
+      note: "Fresh GitHub OIDC JWT used for the variant exchange so mismatch failures are not confused with JTI replay protection.",
+      requested_audience: AUDIENCE,
+      jwt_sha256_only: sha256(variantJwt),
+      safe_claims: safeClaimsFromDecoded(variantDecoded),
+    };
     evidence.exchange.variant_request_body_fingerprint = fingerprintExchangeOverrides(selected.overrides);
-    variant = await exchange(`variant-${EXPERIMENT}`, jwt, selected.overrides);
+    variant = await exchange(`variant-${EXPERIMENT}`, variantJwt, selected.overrides);
     evidence.exchange.results.push(variant);
   }
 
@@ -825,27 +856,7 @@ async function main() {
   await mkdir(OUT_DIR, { recursive: true });
   const jwt = await getGithubOidc(AUDIENCE);
   const decoded = decodeJwt(jwt);
-
-  const safeClaims = {
-    iss: decoded.payload.iss,
-    aud: decoded.payload.aud,
-    sub: decoded.payload.sub,
-    repository: decoded.payload.repository,
-    repository_owner: decoded.payload.repository_owner,
-    repository_id: decoded.payload.repository_id,
-    repository_owner_id: decoded.payload.repository_owner_id,
-    ref: decoded.payload.ref,
-    ref_type: decoded.payload.ref_type,
-    sha: decoded.payload.sha,
-    workflow: decoded.payload.workflow,
-    workflow_ref: decoded.payload.workflow_ref,
-    job_workflow_ref: decoded.payload.job_workflow_ref,
-    event_name: decoded.payload.event_name,
-    actor: decoded.payload.actor,
-    actor_id: decoded.payload.actor_id,
-    run_id: decoded.payload.run_id,
-    run_attempt: decoded.payload.run_attempt,
-  };
+  const safeClaims = safeClaimsFromDecoded(decoded);
 
   const evidence = {
     generated_at: new Date().toISOString(),
@@ -878,6 +889,7 @@ async function main() {
       attempted: process.env.RUN_EXCHANGE === "true",
       missing_variables: requireExchangeVars(),
       results: [],
+      variant_github_oidc: null,
       message_smoke: null,
       file_smoke: null,
       batch_smoke: null,
@@ -912,6 +924,13 @@ async function main() {
         exchange: {
           attempted: evidence.exchange.attempted,
           missing_variables: evidence.exchange.missing_variables,
+          variant_github_oidc: evidence.exchange.variant_github_oidc
+            ? {
+                requested_audience: evidence.exchange.variant_github_oidc.requested_audience,
+                jwt_sha256_only: evidence.exchange.variant_github_oidc.jwt_sha256_only,
+                safe_claims: evidence.exchange.variant_github_oidc.safe_claims,
+              }
+            : null,
           variant_request_body_fingerprint: evidence.exchange.variant_request_body_fingerprint || null,
           summary: evidence.exchange.results.map((item) => ({
             label: item.label,
