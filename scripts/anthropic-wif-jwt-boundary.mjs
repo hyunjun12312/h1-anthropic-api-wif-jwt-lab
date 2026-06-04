@@ -133,6 +133,28 @@ async function exchange(label, assertion, overrides = {}) {
   return result;
 }
 
+async function adminSmoke(label, accessToken) {
+  const res = await fetch(`${BASE_URL}/v1/organizations/workspaces`, {
+    method: "GET",
+    headers: {
+      "anthropic-version": VERSION,
+      authorization: `Bearer ${accessToken}`,
+      "x-hackerone-handle": process.env.H1_HANDLE || "cyclopesy",
+    },
+  });
+  const { text, contentType, parsed } = await parseJsonResponse(res);
+  return {
+    label,
+    status: res.status,
+    ok: res.ok,
+    content_type: contentType,
+    body_sha256: sha256(text),
+    error_type: parsed?.error?.type ?? parsed?.error ?? null,
+    error_message: parsed?.error?.message ?? null,
+    body_preview: redact(parsed),
+  };
+}
+
 async function messageSmoke(label, accessToken) {
   const res = await fetch(`${BASE_URL}/v1/messages`, {
     method: "POST",
@@ -333,6 +355,10 @@ async function runSelectedExperiment(evidence, jwt, safeClaims) {
       "control-access-token-message-smoke",
       control._accessTokenForSmokeOnly,
     );
+    evidence.exchange.admin_smoke = await adminSmoke(
+      "control-access-token-admin-api-smoke",
+      control._accessTokenForSmokeOnly,
+    );
   }
 
   evidence.classification = classifySelectedExperiment(EXPERIMENT, control, variant, safeClaims);
@@ -396,6 +422,7 @@ async function main() {
       missing_variables: requireExchangeVars(),
       results: [],
       message_smoke: null,
+      admin_smoke: null,
     },
     classification: "claims_collected_only",
   };
@@ -437,6 +464,14 @@ async function main() {
                 ok: evidence.exchange.message_smoke.ok,
                 message_id: evidence.exchange.message_smoke.message_id,
                 error_type: evidence.exchange.message_smoke.error_type,
+              }
+            : null,
+          admin_smoke: evidence.exchange.admin_smoke
+            ? {
+                status: evidence.exchange.admin_smoke.status,
+                ok: evidence.exchange.admin_smoke.ok,
+                error_type: evidence.exchange.admin_smoke.error_type,
+                error_message: evidence.exchange.admin_smoke.error_message,
               }
             : null,
         },
