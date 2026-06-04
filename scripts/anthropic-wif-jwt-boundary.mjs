@@ -244,6 +244,24 @@ async function main() {
     } else {
       const control = await exchange("control-real-github-oidc-jwt", jwt);
       evidence.exchange.results.push(control);
+
+      // JTI replay check: the exact same GitHub-signed JWT should not normally be
+      // exchangeable twice when the federation issuer has check_jti=true.
+      const replay = await exchange("replay-same-real-github-oidc-jwt", jwt);
+      evidence.exchange.results.push(replay);
+
+      // Workspace boundary check: the rule is configured for Workspace A. If an
+      // alternate Workspace B is supplied as a repo variable, try to swap only the
+      // workspace_id in the exchange body while keeping the same real GitHub JWT,
+      // federation rule, and service account.
+      if (process.env.ANTHROPIC_ALT_WORKSPACE_ID) {
+        evidence.exchange.results.push(
+          await exchange("workspace-mismatch-alt-workspace-id", jwt, {
+            workspace_id: process.env.ANTHROPIC_ALT_WORKSPACE_ID,
+          }),
+        );
+      }
+
       if (typeof control._accessTokenForSmokeOnly === "string") {
         evidence.exchange.message_smoke = await messageSmoke(
           "control-access-token-message-smoke",
@@ -287,13 +305,18 @@ async function main() {
         evidence.exchange.results.push(await exchange(label, assertion));
       }
 
-      const acceptedMutations = evidence.exchange.results.filter(
+      const acceptedBoundaryBypasses = evidence.exchange.results.filter(
         (item) => item.label !== "control-real-github-oidc-jwt" && item.access_token_returned,
       );
-      if (!control.access_token_returned) {
+      const requestedUnexpectedAudience = AUDIENCE !== "https://api.anthropic.com";
+      if (requestedUnexpectedAudience && control.access_token_returned) {
+        evidence.classification = "candidate_high_real_github_oidc_wrong_audience_accepted";
+      } else if (requestedUnexpectedAudience && !control.access_token_returned) {
+        evidence.classification = "rejected_real_github_oidc_wrong_audience_blocked";
+      } else if (!control.access_token_returned) {
         evidence.classification = "setup_failed_control_exchange_rejected";
-      } else if (acceptedMutations.length) {
-        evidence.classification = "candidate_critical_mutated_jwt_accepted";
+      } else if (acceptedBoundaryBypasses.length) {
+        evidence.classification = "candidate_high_boundary_check_accepted";
       } else {
         evidence.classification = "rejected_mutated_jwts_blocked";
       }
