@@ -1044,6 +1044,8 @@ function variantForExperiment(name) {
     dummy_organization_id: ["organization_id", dummy.dummy_organization_id],
     request_scope_org_manage_tunnels: ["scope", "org:manage_tunnels"],
     request_oauth_scope_org_manage_tunnels: ["oauth_scope", "org:manage_tunnels"],
+    request_scope_workspace_developer: ["scope", "workspace:developer"],
+    request_oauth_scope_workspace_developer: ["oauth_scope", "workspace:developer"],
   };
   const selected = variants[name];
   if (!selected) return null;
@@ -1223,7 +1225,9 @@ async function runSelectedExperiment(evidence, jwt, safeClaims) {
     typeof control._accessTokenForSmokeOnly === "string" &&
     typeof variant?._accessTokenForSmokeOnly === "string" &&
     (EXPERIMENT === "request_scope_org_manage_tunnels" ||
-      EXPERIMENT === "request_oauth_scope_org_manage_tunnels")
+      EXPERIMENT === "request_oauth_scope_org_manage_tunnels" ||
+      EXPERIMENT === "request_scope_workspace_developer" ||
+      EXPERIMENT === "request_oauth_scope_workspace_developer")
   ) {
     evidence.exchange.control_scope_privilege_smoke = await scopePrivilegeSmoke(
       "control-token-privilege-smoke",
@@ -1231,6 +1235,14 @@ async function runSelectedExperiment(evidence, jwt, safeClaims) {
     );
     evidence.exchange.variant_scope_privilege_smoke = await scopePrivilegeSmoke(
       "variant-token-privilege-smoke",
+      variant._accessTokenForSmokeOnly,
+    );
+    evidence.exchange.control_request_scope_file_smoke = await fileSmoke(
+      "control-token-request-scope-file-smoke",
+      control._accessTokenForSmokeOnly,
+    );
+    evidence.exchange.variant_request_scope_file_smoke = await fileSmoke(
+      "variant-token-request-scope-file-smoke",
       variant._accessTokenForSmokeOnly,
     );
   }
@@ -1252,14 +1264,20 @@ async function runSelectedExperiment(evidence, jwt, safeClaims) {
         : "rejected_wif_token_object_scope_bypass_blocked";
   } else if (
     EXPERIMENT === "request_scope_org_manage_tunnels" ||
-    EXPERIMENT === "request_oauth_scope_org_manage_tunnels"
+    EXPERIMENT === "request_oauth_scope_org_manage_tunnels" ||
+    EXPERIMENT === "request_scope_workspace_developer" ||
+    EXPERIMENT === "request_oauth_scope_workspace_developer"
   ) {
     const controlPrivilegedCount = evidence.exchange.control_scope_privilege_smoke?.privileged_2xx_count ?? 0;
     const variantPrivilegedCount = evidence.exchange.variant_scope_privilege_smoke?.privileged_2xx_count ?? 0;
+    const controlFileCreateOk = Boolean(evidence.exchange.control_request_scope_file_smoke?.create?.ok);
+    const variantFileCreateOk = Boolean(evidence.exchange.variant_request_scope_file_smoke?.create?.ok);
     evidence.classification = !variant?.access_token_returned
       ? `rejected_${EXPERIMENT}_blocked`
       : variantPrivilegedCount > controlPrivilegedCount
         ? "candidate_high_request_scope_privilege_expansion"
+        : variantFileCreateOk && !controlFileCreateOk
+          ? "candidate_high_request_scope_workspace_developer_expansion"
         : "rejected_request_scope_override_no_privileged_readback";
   } else {
     evidence.classification = selectedClassification;
@@ -1315,6 +1333,8 @@ async function main() {
       admin_smoke: null,
       control_scope_privilege_smoke: null,
       variant_scope_privilege_smoke: null,
+      control_request_scope_file_smoke: null,
+      variant_request_scope_file_smoke: null,
     },
     classification: "claims_collected_only",
   };
@@ -1524,6 +1544,28 @@ async function main() {
                   error_type: item.error_type,
                   error_message: item.error_message,
                 })),
+              }
+            : null,
+          control_request_scope_file_smoke: evidence.exchange.control_request_scope_file_smoke
+            ? {
+                create_status: evidence.exchange.control_request_scope_file_smoke.create.status,
+                create_ok: evidence.exchange.control_request_scope_file_smoke.create.ok,
+                file_id_returned: evidence.exchange.control_request_scope_file_smoke.create.file_id_returned,
+                retrieve_status: evidence.exchange.control_request_scope_file_smoke.retrieve?.status ?? null,
+                retrieve_ok: evidence.exchange.control_request_scope_file_smoke.retrieve?.ok ?? null,
+                cleanup_status: evidence.exchange.control_request_scope_file_smoke.cleanup?.status ?? null,
+                cleanup_ok: evidence.exchange.control_request_scope_file_smoke.cleanup?.ok ?? null,
+              }
+            : null,
+          variant_request_scope_file_smoke: evidence.exchange.variant_request_scope_file_smoke
+            ? {
+                create_status: evidence.exchange.variant_request_scope_file_smoke.create.status,
+                create_ok: evidence.exchange.variant_request_scope_file_smoke.create.ok,
+                file_id_returned: evidence.exchange.variant_request_scope_file_smoke.create.file_id_returned,
+                retrieve_status: evidence.exchange.variant_request_scope_file_smoke.retrieve?.status ?? null,
+                retrieve_ok: evidence.exchange.variant_request_scope_file_smoke.retrieve?.ok ?? null,
+                cleanup_status: evidence.exchange.variant_request_scope_file_smoke.cleanup?.status ?? null,
+                cleanup_ok: evidence.exchange.variant_request_scope_file_smoke.cleanup?.ok ?? null,
               }
             : null,
         },

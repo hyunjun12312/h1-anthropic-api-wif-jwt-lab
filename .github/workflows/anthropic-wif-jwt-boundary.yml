@@ -32,6 +32,8 @@ on:
           - dummy_organization_id
           - request_scope_org_manage_tunnels
           - request_oauth_scope_org_manage_tunnels
+          - request_scope_workspace_developer
+          - request_oauth_scope_workspace_developer
 
 permissions:
   contents: read
