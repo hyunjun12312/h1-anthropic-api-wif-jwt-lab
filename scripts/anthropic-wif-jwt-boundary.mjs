@@ -175,28 +175,36 @@ async function adminSmoke(label, accessToken) {
     ["api_keys", "/v1/organizations/api_keys"],
     ["usage_report_messages", "/v1/organizations/usage_report/messages"],
   ];
+  const authModes = [
+    ["bearer", { authorization: `Bearer ${accessToken}` }],
+    ["x_api_key", { "x-api-key": accessToken }],
+    ["dual_bearer_and_x_api_key", { authorization: `Bearer ${accessToken}`, "x-api-key": accessToken }],
+  ];
   const results = [];
-  for (const [name, path] of endpoints) {
-    const res = await fetch(`${BASE_URL}${path}`, {
-      method: "GET",
-      headers: {
-        "anthropic-version": VERSION,
-        authorization: `Bearer ${accessToken}`,
-        "x-hackerone-handle": process.env.H1_HANDLE || "cyclopesy",
-      },
-    });
-    const { text, contentType, parsed } = await parseJsonResponse(res);
-    results.push({
-      name,
-      path,
-      status: res.status,
-      ok: res.ok,
-      content_type: contentType,
-      body_sha256: sha256(text),
-      error_type: sanitizeString(parsed?.error?.type ?? parsed?.error ?? null),
-      error_message: sanitizeString(parsed?.error?.message ?? null),
-      body_preview: res.ok ? "[success body omitted]" : redact(parsed),
-    });
+  for (const [auth_mode, authHeadersForMode] of authModes) {
+    for (const [name, path] of endpoints) {
+      const res = await fetch(`${BASE_URL}${path}`, {
+        method: "GET",
+        headers: {
+          "anthropic-version": VERSION,
+          "x-hackerone-handle": process.env.H1_HANDLE || "cyclopesy",
+          ...authHeadersForMode,
+        },
+      });
+      const { text, contentType, parsed } = await parseJsonResponse(res);
+      results.push({
+        auth_mode,
+        name,
+        path,
+        status: res.status,
+        ok: res.ok,
+        content_type: contentType,
+        body_sha256: sha256(text),
+        error_type: sanitizeString(parsed?.error?.type ?? parsed?.error ?? null),
+        error_message: sanitizeString(parsed?.error?.message ?? null),
+        body_preview: res.ok ? "[success body omitted]" : redact(parsed),
+      });
+    }
   }
   return {
     label,
@@ -653,6 +661,7 @@ async function main() {
             ? {
                 any_admin_endpoint_ok: evidence.exchange.admin_smoke.any_admin_endpoint_ok,
                 summary: evidence.exchange.admin_smoke.results.map((item) => ({
+                  auth_mode: item.auth_mode,
                   name: item.name,
                   status: item.status,
                   ok: item.ok,
