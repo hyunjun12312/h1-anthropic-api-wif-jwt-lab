@@ -109,7 +109,7 @@ async function exchange(label, assertion, overrides = {}) {
     body: JSON.stringify(body),
   });
   const { text, contentType, parsed } = await parseJsonResponse(res);
-  return {
+  const result = {
     label,
     status: res.status,
     ok: res.ok,
@@ -123,6 +123,13 @@ async function exchange(label, assertion, overrides = {}) {
     error_message: parsed?.error?.message ?? parsed?.error_description ?? null,
     body_preview: redact(parsed),
   };
+  if (typeof parsed?.access_token === "string") {
+    Object.defineProperty(result, "_accessTokenForSmokeOnly", {
+      value: parsed.access_token,
+      enumerable: false,
+    });
+  }
+  return result;
 }
 
 async function messageSmoke(label, accessToken) {
@@ -237,28 +244,11 @@ async function main() {
     } else {
       const control = await exchange("control-real-github-oidc-jwt", jwt);
       evidence.exchange.results.push(control);
-      if (control.access_token_returned) {
-        // Re-exchange once for the smoke test so the bearer token stays local to this process only.
-        const secondControl = await fetch(`${BASE_URL}/v1/oauth/token`, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "anthropic-version": VERSION,
-            "x-hackerone-handle": process.env.H1_HANDLE || "cyclopesy",
-          },
-          body: JSON.stringify({
-            grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-            assertion: jwt,
-            organization_id: process.env.ANTHROPIC_ORGANIZATION_ID,
-            workspace_id: process.env.ANTHROPIC_WORKSPACE_ID,
-            federation_rule_id: process.env.ANTHROPIC_FEDERATION_RULE_ID,
-            service_account_id: process.env.ANTHROPIC_SERVICE_ACCOUNT_ID,
-          }),
-        });
-        const parsed = await secondControl.json();
-        if (typeof parsed.access_token === "string") {
-          evidence.exchange.message_smoke = await messageSmoke("control-access-token-message-smoke", parsed.access_token);
-        }
+      if (typeof control._accessTokenForSmokeOnly === "string") {
+        evidence.exchange.message_smoke = await messageSmoke(
+          "control-access-token-message-smoke",
+          control._accessTokenForSmokeOnly,
+        );
       }
 
       const mutations = [
