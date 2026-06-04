@@ -36,6 +36,14 @@ function decodeJwt(jwt) {
   };
 }
 
+function sanitizeString(value) {
+  if (typeof value !== "string") return value ?? null;
+  return value
+    .replace(/sk-ant-[A-Za-z0-9._-]+/g, "[redacted:anthropic-token]")
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
+    .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g, "[redacted:jwt]");
+}
+
 function redact(value) {
   if (Array.isArray(value)) return value.map(redact);
   if (value && typeof value === "object") {
@@ -48,9 +56,7 @@ function redact(value) {
       }),
     );
   }
-  if (typeof value === "string" && /sk-ant-[A-Za-z0-9._-]+/.test(value)) {
-    return "[redacted:anthropic-token]";
-  }
+  if (typeof value === "string") return sanitizeString(value);
   return value;
 }
 
@@ -120,8 +126,8 @@ async function exchange(label, assertion, overrides = {}) {
     access_token_sha256: typeof parsed?.access_token === "string" ? sha256(parsed.access_token) : null,
     token_type: parsed?.token_type ?? null,
     expires_in: parsed?.expires_in ?? null,
-    error_type: parsed?.error?.type ?? parsed?.error ?? null,
-    error_message: parsed?.error?.message ?? parsed?.error_description ?? null,
+    error_type: sanitizeString(parsed?.error?.type ?? parsed?.error ?? null),
+    error_message: sanitizeString(parsed?.error?.message ?? parsed?.error_description ?? null),
     body_preview: redact(parsed),
   };
   if (typeof parsed?.access_token === "string") {
@@ -149,9 +155,9 @@ async function adminSmoke(label, accessToken) {
     ok: res.ok,
     content_type: contentType,
     body_sha256: sha256(text),
-    error_type: parsed?.error?.type ?? parsed?.error ?? null,
-    error_message: parsed?.error?.message ?? null,
-    body_preview: redact(parsed),
+    error_type: sanitizeString(parsed?.error?.type ?? parsed?.error ?? null),
+    error_message: sanitizeString(parsed?.error?.message ?? null),
+    body_preview: res.ok ? "[success body omitted]" : redact(parsed),
   };
 }
 
@@ -178,9 +184,9 @@ async function messageSmoke(label, accessToken) {
     content_type: contentType,
     body_sha256: sha256(text),
     message_id: typeof parsed?.id === "string" ? parsed.id : null,
-    error_type: parsed?.error?.type ?? parsed?.error ?? null,
-    error_message: parsed?.error?.message ?? null,
-    body_preview: redact(parsed),
+    error_type: sanitizeString(parsed?.error?.type ?? parsed?.error ?? null),
+    error_message: sanitizeString(parsed?.error?.message ?? null),
+    body_preview: res.ok ? "[success body omitted]" : redact(parsed),
   };
 }
 
