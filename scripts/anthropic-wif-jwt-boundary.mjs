@@ -8,6 +8,8 @@ const VERSION = process.env.ANTHROPIC_VERSION || "2023-06-01";
 const AUDIENCE = process.env.INPUT_AUDIENCE || "https://api.anthropic.com";
 const EXPERIMENT = process.env.INPUT_EXPERIMENT || "legacy_suite";
 const OUT_DIR = "evidence";
+const FILES_BETA = process.env.ANTHROPIC_FILES_BETA || "files-api-2025-04-14";
+const MESSAGE_BATCHES_BETA = process.env.ANTHROPIC_MESSAGE_BATCHES_BETA || "";
 
 function sha256(value) {
   return createHash("sha256").update(String(value)).digest("hex");
@@ -93,6 +95,32 @@ async function parseJsonResponse(res) {
     }
   }
   return { text, contentType, parsed };
+}
+
+
+function maybeBeta(value) {
+  return value ? { "anthropic-beta": value } : {};
+}
+
+function authHeaders(accessToken, extra = {}) {
+  return {
+    "anthropic-version": VERSION,
+    authorization: `Bearer ${accessToken}`,
+    "x-hackerone-handle": process.env.H1_HANDLE || "cyclopesy",
+    ...extra,
+  };
+}
+
+function compactHttpResult(res, parsedResponse, successBody = "[success body omitted]") {
+  return {
+    status: res.status,
+    ok: res.ok,
+    content_type: parsedResponse.contentType,
+    body_sha256: sha256(parsedResponse.text),
+    error_type: sanitizeString(parsedResponse.parsed?.error?.type ?? parsedResponse.parsed?.error ?? null),
+    error_message: sanitizeString(parsedResponse.parsed?.error?.message ?? null),
+    body_preview: res.ok ? successBody : redact(parsedResponse.parsed),
+  };
 }
 
 async function exchange(label, assertion, overrides = {}) {
@@ -203,6 +231,107 @@ async function messageSmoke(label, accessToken) {
     error_type: sanitizeString(parsed?.error?.type ?? parsed?.error ?? null),
     error_message: sanitizeString(parsed?.error?.message ?? null),
     body_preview: res.ok ? "[success body omitted]" : redact(parsed),
+  };
+}
+
+
+async function fileSmoke(label, accessToken) {
+  const form = new FormData();
+  form.set("purpose", "user_data");
+  form.set(
+    "file",
+    new Blob([`h1 owned file smoke ${new Date().toISOString()}\n`], { type: "text/plain" }),
+    "h1-owned-file-smoke.txt",
+  );
+  const createRes = await fetch(`${BASE_URL}/v1/files`, {
+    method: "POST",
+    headers: authHeaders(accessToken, maybeBeta(FILES_BETA)),
+    body: form,
+  });
+  const createParsed = await parseJsonResponse(createRes);
+  const fileId = typeof createParsed.parsed?.id === "string" ? createParsed.parsed.id : null;
+
+  let retrieve = null;
+  if (fileId) {
+    const retrieveRes = await fetch(`${BASE_URL}/v1/files/${encodeURIComponent(fileId)}`, {
+      method: "GET",
+      headers: authHeaders(accessToken, maybeBeta(FILES_BETA)),
+    });
+    retrieve = compactHttpResult(retrieveRes, await parseJsonResponse(retrieveRes));
+  }
+
+  let cleanup = null;
+  if (fileId) {
+    const deleteRes = await fetch(`${BASE_URL}/v1/files/${encodeURIComponent(fileId)}`, {
+      method: "DELETE",
+      headers: authHeaders(accessToken, maybeBeta(FILES_BETA)),
+    });
+    cleanup = compactHttpResult(deleteRes, await parseJsonResponse(deleteRes));
+  }
+
+  return {
+    label,
+    create: {
+      ...compactHttpResult(createRes, createParsed),
+      file_id_returned: Boolean(fileId),
+      file_id_sha256: fileId ? sha256(fileId) : null,
+    },
+    retrieve,
+    cleanup,
+  };
+}
+
+async function batchSmoke(label, accessToken) {
+  const customId = `h1-owned-batch-smoke-${Date.now()}`;
+  const createRes = await fetch(`${BASE_URL}/v1/messages/batches`, {
+    method: "POST",
+    headers: authHeaders(accessToken, {
+      "content-type": "application/json",
+      ...maybeBeta(MESSAGE_BATCHES_BETA),
+    }),
+    body: JSON.stringify({
+      requests: [
+        {
+          custom_id: customId,
+          params: {
+            model: process.env.ANTHROPIC_TEST_MODEL || "claude-haiku-4-5-20251001",
+            max_tokens: 1,
+            messages: [{ role: "user", content: "Reply OK." }],
+          },
+        },
+      ],
+    }),
+  });
+  const createParsed = await parseJsonResponse(createRes);
+  const batchId = typeof createParsed.parsed?.id === "string" ? createParsed.parsed.id : null;
+
+  let retrieve = null;
+  if (batchId) {
+    const retrieveRes = await fetch(`${BASE_URL}/v1/messages/batches/${encodeURIComponent(batchId)}`, {
+      method: "GET",
+      headers: authHeaders(accessToken, maybeBeta(MESSAGE_BATCHES_BETA)),
+    });
+    retrieve = compactHttpResult(retrieveRes, await parseJsonResponse(retrieveRes));
+  }
+
+  let cancel = null;
+  if (batchId) {
+    const cancelRes = await fetch(`${BASE_URL}/v1/messages/batches/${encodeURIComponent(batchId)}/cancel`, {
+      method: "POST",
+      headers: authHeaders(accessToken, maybeBeta(MESSAGE_BATCHES_BETA)),
+    });
+    cancel = compactHttpResult(cancelRes, await parseJsonResponse(cancelRes));
+  }
+
+  return {
+    label,
+    create: {
+      ...compactHttpResult(createRes, createParsed),
+      batch_id_returned: Boolean(batchId),
+      batch_id_sha256: batchId ? sha256(batchId) : null,
+    },
+    retrieve,
+    cancel,
   };
 }
 
@@ -377,6 +506,14 @@ async function runSelectedExperiment(evidence, jwt, safeClaims) {
       "control-access-token-message-smoke",
       control._accessTokenForSmokeOnly,
     );
+    evidence.exchange.file_smoke = await fileSmoke(
+      "control-access-token-owned-file-smoke",
+      control._accessTokenForSmokeOnly,
+    );
+    evidence.exchange.batch_smoke = await batchSmoke(
+      "control-access-token-owned-batch-smoke",
+      control._accessTokenForSmokeOnly,
+    );
     evidence.exchange.admin_smoke = await adminSmoke(
       "control-access-token-admin-api-smoke",
       control._accessTokenForSmokeOnly,
@@ -444,6 +581,8 @@ async function main() {
       missing_variables: requireExchangeVars(),
       results: [],
       message_smoke: null,
+      file_smoke: null,
+      batch_smoke: null,
       admin_smoke: null,
     },
     classification: "claims_collected_only",
@@ -488,6 +627,28 @@ async function main() {
                 error_type: evidence.exchange.message_smoke.error_type,
               }
             : null,
+          file_smoke: evidence.exchange.file_smoke
+            ? {
+                create_status: evidence.exchange.file_smoke.create.status,
+                create_ok: evidence.exchange.file_smoke.create.ok,
+                file_id_returned: evidence.exchange.file_smoke.create.file_id_returned,
+                retrieve_status: evidence.exchange.file_smoke.retrieve?.status ?? null,
+                retrieve_ok: evidence.exchange.file_smoke.retrieve?.ok ?? null,
+                cleanup_status: evidence.exchange.file_smoke.cleanup?.status ?? null,
+                cleanup_ok: evidence.exchange.file_smoke.cleanup?.ok ?? null,
+              }
+            : null,
+          batch_smoke: evidence.exchange.batch_smoke
+            ? {
+                create_status: evidence.exchange.batch_smoke.create.status,
+                create_ok: evidence.exchange.batch_smoke.create.ok,
+                batch_id_returned: evidence.exchange.batch_smoke.create.batch_id_returned,
+                retrieve_status: evidence.exchange.batch_smoke.retrieve?.status ?? null,
+                retrieve_ok: evidence.exchange.batch_smoke.retrieve?.ok ?? null,
+                cancel_status: evidence.exchange.batch_smoke.cancel?.status ?? null,
+                cancel_ok: evidence.exchange.batch_smoke.cancel?.ok ?? null,
+              }
+            : null,
           admin_smoke: evidence.exchange.admin_smoke
             ? {
                 any_admin_endpoint_ok: evidence.exchange.admin_smoke.any_admin_endpoint_ok,
@@ -512,4 +673,3 @@ main().catch((error) => {
   console.error(error instanceof Error ? error.stack || error.message : String(error));
   process.exit(1);
 });
-
