@@ -343,6 +343,185 @@ async function batchSmoke(label, accessToken) {
   };
 }
 
+
+async function getFileMetadata(accessToken, fileId, extraHeaders = {}) {
+  const res = await fetch(`${BASE_URL}/v1/files/${encodeURIComponent(fileId)}`, {
+    method: "GET",
+    headers: authHeaders(accessToken, { ...maybeBeta(FILES_BETA), ...extraHeaders }),
+  });
+  return compactHttpResult(res, await parseJsonResponse(res));
+}
+
+async function getFileContent(accessToken, fileId, extraHeaders = {}) {
+  const res = await fetch(`${BASE_URL}/v1/files/${encodeURIComponent(fileId)}/content`, {
+    method: "GET",
+    headers: authHeaders(accessToken, { ...maybeBeta(FILES_BETA), ...extraHeaders }),
+  });
+  return compactHttpResult(res, await parseJsonResponse(res));
+}
+
+async function fileLifecycleSmoke(label, accessToken) {
+  const marker = `H1_WIF_FILE_TOMBSTONE_${Date.now()}`;
+  const form = new FormData();
+  form.set("purpose", "user_data");
+  form.set("file", new Blob([`${marker}\n`], { type: "text/plain" }), "h1-file-lifecycle.txt");
+
+  const createRes = await fetch(`${BASE_URL}/v1/files`, {
+    method: "POST",
+    headers: authHeaders(accessToken, maybeBeta(FILES_BETA)),
+    body: form,
+  });
+  const createParsed = await parseJsonResponse(createRes);
+  const fileId = typeof createParsed.parsed?.id === "string" ? createParsed.parsed.id : null;
+  const result = {
+    label,
+    marker_sha256: sha256(marker),
+    create: {
+      ...compactHttpResult(createRes, createParsed),
+      file_id_returned: Boolean(fileId),
+      file_id_sha256: fileId ? sha256(fileId) : null,
+    },
+    pre_delete_metadata: null,
+    pre_delete_content: null,
+    delete: null,
+    post_delete_metadata: null,
+    post_delete_content: null,
+    wrong_beta_metadata: null,
+    no_beta_metadata: null,
+    candidate_stale_read: false,
+  };
+  if (!fileId) return result;
+
+  result.pre_delete_metadata = await getFileMetadata(accessToken, fileId);
+  result.pre_delete_content = await getFileContent(accessToken, fileId);
+
+  const wrongBetaRes = await fetch(`${BASE_URL}/v1/files/${encodeURIComponent(fileId)}`, {
+    method: "GET",
+    headers: authHeaders(accessToken, { "anthropic-beta": "message-batches-2024-09-24" }),
+  });
+  result.wrong_beta_metadata = compactHttpResult(wrongBetaRes, await parseJsonResponse(wrongBetaRes));
+
+  const noBetaRes = await fetch(`${BASE_URL}/v1/files/${encodeURIComponent(fileId)}`, {
+    method: "GET",
+    headers: authHeaders(accessToken),
+  });
+  result.no_beta_metadata = compactHttpResult(noBetaRes, await parseJsonResponse(noBetaRes));
+
+  const deleteRes = await fetch(`${BASE_URL}/v1/files/${encodeURIComponent(fileId)}`, {
+    method: "DELETE",
+    headers: authHeaders(accessToken, maybeBeta(FILES_BETA)),
+  });
+  result.delete = compactHttpResult(deleteRes, await parseJsonResponse(deleteRes));
+  result.post_delete_metadata = await getFileMetadata(accessToken, fileId);
+  result.post_delete_content = await getFileContent(accessToken, fileId);
+  result.candidate_stale_read = Boolean(result.post_delete_metadata?.ok || result.post_delete_content?.ok);
+  return result;
+}
+
+async function crossWorkspaceObjectIsolation(label, jwt, accessTokenA) {
+  const bCredential = optionalBExchangeVars();
+  const result = {
+    label,
+    status: bCredential.missing.length ? "skipped_missing_b_credential" : "attempted",
+    missing_b_variables: bCredential.missing,
+    b_request_body_fingerprint: bCredential.missing.length ? null : fingerprintExchangeOverrides(bCredential.overrides),
+    b_exchange: null,
+    file: null,
+    batch: null,
+  };
+  if (bCredential.missing.length) return result;
+
+  const bExchange = await exchange("cross-workspace-b-token", jwt, bCredential.overrides);
+  result.b_exchange = bExchange;
+  if (typeof bExchange._accessTokenForSmokeOnly !== "string") {
+    result.status = "b_token_not_minted";
+    return result;
+  }
+  const accessTokenB = bExchange._accessTokenForSmokeOnly;
+
+  let fileId = null;
+  try {
+    const form = new FormData();
+    form.set("purpose", "user_data");
+    form.set("file", new Blob([`h1 cross workspace file ${new Date().toISOString()}\n`], { type: "text/plain" }), "h1-cross-workspace-a.txt");
+    const createRes = await fetch(`${BASE_URL}/v1/files`, {
+      method: "POST",
+      headers: authHeaders(accessTokenA, maybeBeta(FILES_BETA)),
+      body: form,
+    });
+    const createParsed = await parseJsonResponse(createRes);
+    fileId = typeof createParsed.parsed?.id === "string" ? createParsed.parsed.id : null;
+    result.file = {
+      create_a: {
+        ...compactHttpResult(createRes, createParsed),
+        file_id_returned: Boolean(fileId),
+        file_id_sha256: fileId ? sha256(fileId) : null,
+      },
+      retrieve_with_b: fileId ? await getFileMetadata(accessTokenB, fileId) : null,
+      cleanup_a: null,
+    };
+  } finally {
+    if (fileId) {
+      const deleteRes = await fetch(`${BASE_URL}/v1/files/${encodeURIComponent(fileId)}`, {
+        method: "DELETE",
+        headers: authHeaders(accessTokenA, maybeBeta(FILES_BETA)),
+      });
+      result.file.cleanup_a = compactHttpResult(deleteRes, await parseJsonResponse(deleteRes));
+    }
+  }
+
+  let batchId = null;
+  try {
+    const customId = `h1-cross-workspace-batch-${Date.now()}`;
+    const createRes = await fetch(`${BASE_URL}/v1/messages/batches`, {
+      method: "POST",
+      headers: authHeaders(accessTokenA, { "content-type": "application/json", ...maybeBeta(MESSAGE_BATCHES_BETA) }),
+      body: JSON.stringify({
+        requests: [{
+          custom_id: customId,
+          params: {
+            model: process.env.ANTHROPIC_TEST_MODEL || "claude-haiku-4-5-20251001",
+            max_tokens: 1,
+            messages: [{ role: "user", content: "Reply OK." }],
+          },
+        }],
+      }),
+    });
+    const createParsed = await parseJsonResponse(createRes);
+    batchId = typeof createParsed.parsed?.id === "string" ? createParsed.parsed.id : null;
+    let bRetrieve = null;
+    if (batchId) {
+      const bRetrieveRes = await fetch(`${BASE_URL}/v1/messages/batches/${encodeURIComponent(batchId)}`, {
+        method: "GET",
+        headers: authHeaders(accessTokenB, maybeBeta(MESSAGE_BATCHES_BETA)),
+      });
+      bRetrieve = compactHttpResult(bRetrieveRes, await parseJsonResponse(bRetrieveRes));
+    }
+    result.batch = {
+      create_a: {
+        ...compactHttpResult(createRes, createParsed),
+        batch_id_returned: Boolean(batchId),
+        batch_id_sha256: batchId ? sha256(batchId) : null,
+      },
+      retrieve_with_b: bRetrieve,
+      cleanup_a: null,
+    };
+  } finally {
+    if (batchId) {
+      const cancelRes = await fetch(`${BASE_URL}/v1/messages/batches/${encodeURIComponent(batchId)}/cancel`, {
+        method: "POST",
+        headers: authHeaders(accessTokenA, maybeBeta(MESSAGE_BATCHES_BETA)),
+      });
+      result.batch.cleanup_a = compactHttpResult(cancelRes, await parseJsonResponse(cancelRes));
+    }
+  }
+
+  result.status = result.file?.retrieve_with_b?.ok || result.batch?.retrieve_with_b?.ok
+    ? "candidate_cross_workspace_object_read"
+    : "cross_workspace_object_reads_blocked";
+  return result;
+}
+
 function unsignedJwtFrom(decoded, payloadOverrides = {}, headerOverrides = {}) {
   const header = { ...decoded.header, alg: "none", ...headerOverrides };
   const payload = { ...decoded.payload, ...payloadOverrides };
@@ -363,6 +542,21 @@ function requireExchangeVars() {
     "ANTHROPIC_SERVICE_ACCOUNT_ID",
   ];
   return required.filter((name) => !process.env[name]);
+}
+
+
+function optionalBExchangeVars() {
+  const envToBody = {
+    ANTHROPIC_B_ORGANIZATION_ID: "organization_id",
+    ANTHROPIC_B_WORKSPACE_ID: "workspace_id",
+    ANTHROPIC_B_FEDERATION_RULE_ID: "federation_rule_id",
+    ANTHROPIC_B_SERVICE_ACCOUNT_ID: "service_account_id",
+  };
+  const missing = Object.keys(envToBody).filter((name) => !process.env[name]);
+  const overrides = Object.fromEntries(
+    Object.entries(envToBody).map(([envName, bodyName]) => [bodyName, process.env[envName]]),
+  );
+  return { missing, overrides };
 }
 
 function fingerprintExchangeOverrides(overrides = {}) {
@@ -522,6 +716,15 @@ async function runSelectedExperiment(evidence, jwt, safeClaims) {
       "control-access-token-owned-batch-smoke",
       control._accessTokenForSmokeOnly,
     );
+    evidence.exchange.file_lifecycle_smoke = await fileLifecycleSmoke(
+      "control-access-token-file-lifecycle-smoke",
+      control._accessTokenForSmokeOnly,
+    );
+    evidence.exchange.cross_workspace_object_isolation = await crossWorkspaceObjectIsolation(
+      "control-a-token-cross-workspace-object-isolation",
+      jwt,
+      control._accessTokenForSmokeOnly,
+    );
     evidence.exchange.admin_smoke = await adminSmoke(
       "control-access-token-admin-api-smoke",
       control._accessTokenForSmokeOnly,
@@ -591,6 +794,8 @@ async function main() {
       message_smoke: null,
       file_smoke: null,
       batch_smoke: null,
+      file_lifecycle_smoke: null,
+      cross_workspace_object_isolation: null,
       admin_smoke: null,
     },
     classification: "claims_collected_only",
@@ -655,6 +860,29 @@ async function main() {
                 retrieve_ok: evidence.exchange.batch_smoke.retrieve?.ok ?? null,
                 cancel_status: evidence.exchange.batch_smoke.cancel?.status ?? null,
                 cancel_ok: evidence.exchange.batch_smoke.cancel?.ok ?? null,
+              }
+            : null,
+          file_lifecycle_smoke: evidence.exchange.file_lifecycle_smoke
+            ? {
+                create_status: evidence.exchange.file_lifecycle_smoke.create.status,
+                pre_delete_metadata_status: evidence.exchange.file_lifecycle_smoke.pre_delete_metadata?.status ?? null,
+                delete_status: evidence.exchange.file_lifecycle_smoke.delete?.status ?? null,
+                post_delete_metadata_status: evidence.exchange.file_lifecycle_smoke.post_delete_metadata?.status ?? null,
+                post_delete_metadata_ok: evidence.exchange.file_lifecycle_smoke.post_delete_metadata?.ok ?? null,
+                post_delete_content_status: evidence.exchange.file_lifecycle_smoke.post_delete_content?.status ?? null,
+                post_delete_content_ok: evidence.exchange.file_lifecycle_smoke.post_delete_content?.ok ?? null,
+                candidate_stale_read: evidence.exchange.file_lifecycle_smoke.candidate_stale_read,
+              }
+            : null,
+          cross_workspace_object_isolation: evidence.exchange.cross_workspace_object_isolation
+            ? {
+                status: evidence.exchange.cross_workspace_object_isolation.status,
+                missing_b_variables: evidence.exchange.cross_workspace_object_isolation.missing_b_variables,
+                b_token_minted: evidence.exchange.cross_workspace_object_isolation.b_exchange?.access_token_returned ?? null,
+                file_b_retrieve_status: evidence.exchange.cross_workspace_object_isolation.file?.retrieve_with_b?.status ?? null,
+                file_b_retrieve_ok: evidence.exchange.cross_workspace_object_isolation.file?.retrieve_with_b?.ok ?? null,
+                batch_b_retrieve_status: evidence.exchange.cross_workspace_object_isolation.batch?.retrieve_with_b?.status ?? null,
+                batch_b_retrieve_ok: evidence.exchange.cross_workspace_object_isolation.batch?.retrieve_with_b?.ok ?? null,
               }
             : null,
           admin_smoke: evidence.exchange.admin_smoke
