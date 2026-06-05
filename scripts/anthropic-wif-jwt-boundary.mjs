@@ -11,6 +11,7 @@ const OUT_DIR = "evidence";
 const FILES_BETA = process.env.ANTHROPIC_FILES_BETA || "files-api-2025-04-14";
 const MESSAGE_BATCHES_BETA = process.env.ANTHROPIC_MESSAGE_BATCHES_BETA || "";
 const TUNNELS_BETA = process.env.ANTHROPIC_TUNNELS_BETA || "mcp-tunnels-2026-05-19";
+const SKILLS_BETA = process.env.ANTHROPIC_SKILLS_BETA || "skills-2025-10-02";
 
 function sha256(value) {
   return createHash("sha256").update(String(value)).digest("hex");
@@ -143,6 +144,26 @@ function apiKeyHeaders(apiKey, extra = {}) {
     "x-hackerone-handle": process.env.H1_HANDLE || "cyclopesy",
     ...extra,
   };
+}
+
+function skillForm(label, marker) {
+  const suffix = sha256(`${label}:${marker}`).slice(0, 8);
+  const root = `h1_wif_skill_${suffix}`;
+  const content = `---
+name: h1-wif-skill-${suffix}
+description: Harmless HackerOne WIF skill content download boundary test.
+---
+
+# H1 WIF Skill Content Boundary
+
+Marker: ${marker}
+Marker SHA256: ${sha256(marker)}
+`;
+  const form = new FormData();
+  form.append("display_title", `H1 WIF Skill ${suffix}`);
+  form.append("files[]", new Blob([content], { type: "text/markdown" }), `${root}/SKILL.md`);
+  form.append("files[]", new Blob([`marker=${marker}\n`], { type: "text/plain" }), `${root}/marker.txt`);
+  return form;
 }
 
 function compactHttpResult(res, parsedResponse, successBody = "[success body omitted]") {
@@ -605,6 +626,185 @@ async function batchLifecycleSmoke(label, accessToken) {
   result.post_cancel_results = await getBatchResults(accessToken, batchId);
   result.candidate_unexpected_results_access = Boolean(result.post_cancel_results?.ok);
   return result;
+}
+
+async function skillRequest(label, headers, method, route, body = undefined, marker = "") {
+  const res = await fetch(`${BASE_URL}${route}`, { method, headers, body });
+  const { text, contentType, parsed } = await parseJsonResponse(res);
+  const bodyText = typeof parsed === "string" ? parsed : JSON.stringify(parsed ?? "");
+  const zipSignature = Buffer.from(text).slice(0, 4).toString("hex");
+  return {
+    label,
+    method,
+    route,
+    status: res.status,
+    ok: res.ok,
+    content_type: contentType,
+    byte_length: text.length,
+    body_sha256: sha256(text),
+    zip_signature: zipSignature,
+    zip_like: zipSignature === "504b0304" || contentType.includes("zip") || contentType.includes("binary"),
+    marker_present: marker ? bodyText.includes(marker) : false,
+    marker_hash_present: marker ? bodyText.includes(sha256(marker)) : false,
+    id: sanitizeString(parsed?.id ?? null),
+    latest_version: sanitizeString(parsed?.latest_version ?? null),
+    first_version:
+      typeof parsed?.data?.[0]?.version === "string" || typeof parsed?.data?.[0]?.version === "number"
+        ? String(parsed.data[0].version)
+        : null,
+    error_type: sanitizeString(parsed?.error?.type ?? parsed?.type ?? null),
+    error_message: sanitizeString(parsed?.error?.message ?? null),
+    body_preview: res.ok ? "[success body omitted]" : redact(parsed),
+  };
+}
+
+async function setupSkillBundle(label, headers, marker) {
+  const create = await skillRequest(`${label}:create-skill`, headers, "POST", "/v1/skills?beta=true", skillForm(label, marker), marker);
+  const skillId = typeof create.id === "string" && create.id.startsWith("skill_") ? create.id : null;
+  const listVersions = skillId
+    ? await skillRequest(
+        `${label}:list-versions`,
+        headers,
+        "GET",
+        `/v1/skills/${encodeURIComponent(skillId)}/versions?beta=true`,
+        undefined,
+        marker,
+      )
+    : null;
+  const version = create.latest_version || listVersions?.first_version || null;
+  return { create, listVersions, skill_id: skillId, version, marker_sha256: sha256(marker) };
+}
+
+async function downloadSkillContent(label, headers, skillId, version, marker) {
+  if (!skillId || !version) {
+    return {
+      label,
+      method: "GET",
+      route: null,
+      status: "skipped",
+      ok: false,
+      error_type: "missing_skill_or_version",
+      error_message: "Missing skill_id or version for content download",
+      marker_present: false,
+      marker_hash_present: false,
+      zip_like: false,
+    };
+  }
+  return skillRequest(
+    label,
+    { ...headers, Accept: "application/binary" },
+    "GET",
+    `/v1/skills/${encodeURIComponent(skillId)}/versions/${encodeURIComponent(version)}/content?beta=true`,
+    undefined,
+    marker,
+  );
+}
+
+async function cleanupSkillBundle(label, headers, skillId, versions) {
+  const out = [];
+  if (!skillId) return out;
+  for (const version of [...new Set(versions.filter(Boolean))]) {
+    out.push(
+      await skillRequest(
+        `${label}:cleanup-delete-version:${version}`,
+        headers,
+        "DELETE",
+        `/v1/skills/${encodeURIComponent(skillId)}/versions/${encodeURIComponent(version)}?beta=true`,
+      ),
+    );
+  }
+  out.push(
+    await skillRequest(
+      `${label}:cleanup-delete-skill`,
+      headers,
+      "DELETE",
+      `/v1/skills/${encodeURIComponent(skillId)}?beta=true`,
+    ),
+  );
+  return out.map((item) => ({
+    label: item.label,
+    route: item.route,
+    status: item.status,
+    ok: item.ok,
+    error_type: item.error_type,
+    error_message: item.error_message,
+  }));
+}
+
+async function skillContentDownloadSmoke(label, accessToken) {
+  const wifHeaders = authHeaders(accessToken, { "anthropic-beta": SKILLS_BETA });
+  const apiKeyB = process.env.ANTHROPIC_API_KEY_B;
+  const markerA = `H1_WIF_SKILL_OWNER_${Date.now()}`;
+  const markerB = `H1_WIF_SKILL_CROSS_${Date.now()}`;
+  const out = {
+    label,
+    api_key_b_available: Boolean(apiKeyB),
+    owner_wif_bundle: null,
+    owner_wif_download: null,
+    b_api_key_bundle: null,
+    cross_wif_download_b_skill: null,
+    cleanup: [],
+    status: "manual_review_unclassified",
+  };
+
+  out.owner_wif_bundle = await setupSkillBundle("A-WIF", wifHeaders, markerA);
+  out.owner_wif_download = await downloadSkillContent(
+    "A-WIF:owner-download",
+    wifHeaders,
+    out.owner_wif_bundle.skill_id,
+    out.owner_wif_bundle.version,
+    markerA,
+  );
+
+  const ownerGateOk =
+    Boolean(out.owner_wif_download?.ok) &&
+    (out.owner_wif_download.marker_present || out.owner_wif_download.marker_hash_present || out.owner_wif_download.zip_like);
+
+  if (apiKeyB && ownerGateOk) {
+    const keyBHeaders = apiKeyHeaders(apiKeyB, { "anthropic-beta": SKILLS_BETA });
+    out.b_api_key_bundle = await setupSkillBundle("B-APIKEY", keyBHeaders, markerB);
+    out.cross_wif_download_b_skill = await downloadSkillContent(
+      "A-WIF:cross-download-B-skill",
+      wifHeaders,
+      out.b_api_key_bundle.skill_id,
+      out.b_api_key_bundle.version,
+      markerB,
+    );
+  }
+
+  out.cleanup.push(
+    ...(await cleanupSkillBundle("A-WIF", wifHeaders, out.owner_wif_bundle.skill_id, [out.owner_wif_bundle.version])),
+  );
+  if (out.b_api_key_bundle?.skill_id && apiKeyB) {
+    out.cleanup.push(
+      ...(await cleanupSkillBundle(
+        "B-APIKEY",
+        apiKeyHeaders(apiKeyB, { "anthropic-beta": SKILLS_BETA }),
+        out.b_api_key_bundle.skill_id,
+        [out.b_api_key_bundle.version],
+      )),
+    );
+  }
+
+  const crossLeak =
+    Boolean(out.cross_wif_download_b_skill?.ok) &&
+    (out.cross_wif_download_b_skill.marker_present ||
+      out.cross_wif_download_b_skill.marker_hash_present ||
+      out.cross_wif_download_b_skill.zip_like);
+
+  if (!out.owner_wif_bundle?.create?.ok) {
+    out.status = "blocked_wif_bearer_skill_create_failed";
+  } else if (!ownerGateOk) {
+    out.status = "blocked_wif_bearer_owner_content_download_not_available";
+  } else if (!apiKeyB) {
+    out.status = "blocked_owner_wif_download_works_b_key_missing_for_cross";
+  } else if (crossLeak) {
+    out.status = "candidate_cross_skill_content_download_with_wif_bearer";
+  } else {
+    out.status = "rejected_wif_bearer_cross_skill_content_download_blocked";
+  }
+
+  return out;
 }
 
 async function wifTokenVsApiKeyBObjectIsolation(label, accessTokenA) {
@@ -1188,6 +1388,13 @@ async function runSelectedExperiment(evidence, jwt, safeClaims) {
     );
   }
 
+  if (typeof control._accessTokenForSmokeOnly === "string" && EXPERIMENT === "skill_content_download") {
+    evidence.exchange.skill_content_smoke = await skillContentDownloadSmoke(
+      "control-access-token-skill-content-download-smoke",
+      control._accessTokenForSmokeOnly,
+    );
+  }
+
   if (typeof control._accessTokenForSmokeOnly === "string" && EXPERIMENT === "baseline") {
     evidence.exchange.message_smoke = await messageSmoke(
       "control-access-token-message-smoke",
@@ -1286,6 +1493,8 @@ async function runSelectedExperiment(evidence, jwt, safeClaims) {
         : variantFileCreateOk && !controlFileCreateOk
           ? "candidate_high_request_scope_workspace_developer_expansion"
         : "rejected_request_scope_override_no_privileged_readback";
+  } else if (EXPERIMENT === "skill_content_download") {
+    evidence.classification = evidence.exchange.skill_content_smoke?.status || "blocked_skill_content_smoke_not_run";
   } else {
     evidence.classification = selectedClassification;
   }
@@ -1338,6 +1547,7 @@ async function main() {
       wif_token_workspace_header_create_isolation: null,
       cross_workspace_object_isolation: null,
       admin_smoke: null,
+      skill_content_smoke: null,
       control_scope_privilege_smoke: null,
       variant_scope_privilege_smoke: null,
       control_request_scope_file_smoke: null,
@@ -1523,6 +1733,30 @@ async function main() {
                   error_type: item.error_type,
                   error_message: item.error_message,
                 })),
+              }
+            : null,
+          skill_content_smoke: evidence.exchange.skill_content_smoke
+            ? {
+                status: evidence.exchange.skill_content_smoke.status,
+                api_key_b_available: evidence.exchange.skill_content_smoke.api_key_b_available,
+                owner_skill_create_status:
+                  evidence.exchange.skill_content_smoke.owner_wif_bundle?.create?.status ?? null,
+                owner_skill_version:
+                  evidence.exchange.skill_content_smoke.owner_wif_bundle?.version ? "[present]" : null,
+                owner_download_status: evidence.exchange.skill_content_smoke.owner_wif_download?.status ?? null,
+                owner_download_ok: evidence.exchange.skill_content_smoke.owner_wif_download?.ok ?? null,
+                owner_download_marker_present:
+                  evidence.exchange.skill_content_smoke.owner_wif_download?.marker_present ?? null,
+                owner_download_zip_like: evidence.exchange.skill_content_smoke.owner_wif_download?.zip_like ?? null,
+                b_skill_create_status:
+                  evidence.exchange.skill_content_smoke.b_api_key_bundle?.create?.status ?? null,
+                cross_download_status:
+                  evidence.exchange.skill_content_smoke.cross_wif_download_b_skill?.status ?? null,
+                cross_download_ok:
+                  evidence.exchange.skill_content_smoke.cross_wif_download_b_skill?.ok ?? null,
+                cross_download_marker_present:
+                  evidence.exchange.skill_content_smoke.cross_wif_download_b_skill?.marker_present ?? null,
+                cleanup_count: evidence.exchange.skill_content_smoke.cleanup?.length ?? 0,
               }
             : null,
           control_scope_privilege_smoke: evidence.exchange.control_scope_privilege_smoke

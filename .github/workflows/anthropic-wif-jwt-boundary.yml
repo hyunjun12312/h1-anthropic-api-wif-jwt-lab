@@ -21,6 +21,7 @@ on:
           - legacy_suite
           - baseline
           - baseline_file_lifecycle
+          - skill_content_download
           - replay_same_jti
           - alt_workspace_id
           - alt_service_account_id
@@ -72,6 +73,7 @@ jobs:
           ANTHROPIC_FILES_BETA: ${{ vars.ANTHROPIC_FILES_BETA }}
           ANTHROPIC_MESSAGE_BATCHES_BETA: ${{ vars.ANTHROPIC_MESSAGE_BATCHES_BETA }}
           ANTHROPIC_TUNNELS_BETA: mcp-tunnels-2026-05-19
+          ANTHROPIC_SKILLS_BETA: skills-2025-10-02
           ANTHROPIC_API_KEY_B: ${{ secrets.ANTHROPIC_API_KEY_B }}
           H1_HANDLE: cyclopesy
         run: node scripts/anthropic-wif-jwt-boundary.mjs
