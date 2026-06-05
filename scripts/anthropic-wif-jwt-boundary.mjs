@@ -1153,7 +1153,7 @@ async function runSelectedExperiment(evidence, jwt, safeClaims) {
   evidence.exchange.results.push(control);
 
   let variant = null;
-  if (EXPERIMENT === "baseline") {
+  if (EXPERIMENT === "baseline" || EXPERIMENT === "baseline_file_lifecycle") {
     // Baseline only: prove the valid GitHub OIDC token can still mint a scoped Anthropic token.
   } else if (EXPERIMENT === "replay_same_jti") {
     variant = await exchange("variant-replay-same-real-github-oidc-jwt", jwt);
