@@ -1181,6 +1181,13 @@ async function runSelectedExperiment(evidence, jwt, safeClaims) {
     evidence.exchange.results.push(variant);
   }
 
+  if (typeof control._accessTokenForSmokeOnly === "string" && EXPERIMENT === "baseline_file_lifecycle") {
+    evidence.exchange.file_lifecycle_smoke = await fileLifecycleSmoke(
+      "control-access-token-file-lifecycle-smoke",
+      control._accessTokenForSmokeOnly,
+    );
+  }
+
   if (typeof control._accessTokenForSmokeOnly === "string" && EXPERIMENT === "baseline") {
     evidence.exchange.message_smoke = await messageSmoke(
       "control-access-token-message-smoke",

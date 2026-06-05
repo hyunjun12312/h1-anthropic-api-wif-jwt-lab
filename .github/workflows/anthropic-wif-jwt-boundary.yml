@@ -20,6 +20,7 @@ on:
         options:
           - legacy_suite
           - baseline
+          - baseline_file_lifecycle
           - replay_same_jti
           - alt_workspace_id
           - alt_service_account_id
