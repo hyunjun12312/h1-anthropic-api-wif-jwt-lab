@@ -1,0 +1,83 @@
+name: Anthropic WIF environment subject
+
+on:
+  workflow_dispatch:
+    inputs:
+      context:
+        description: "Run with ordinary branch subject or GitHub environment subject"
+        required: true
+        default: "branch"
+        type: choice
+        options:
+          - branch
+          - environment
+      audience:
+        description: "OIDC audience to request from GitHub"
+        required: true
+        default: "https://api.anthropic.com"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  branch:
+    if: ${{ inputs.context == 'branch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Branch-subject WIF exchange
+        env:
+          INPUT_AUDIENCE: ${{ inputs.audience }}
+          INPUT_EXPERIMENT: replay_same_jti
+          RUN_EXCHANGE: true
+          ANTHROPIC_ORGANIZATION_ID: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          ANTHROPIC_WORKSPACE_ID: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+          ANTHROPIC_FEDERATION_RULE_ID: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          H1_HANDLE: cyclopesy
+        run: node scripts/anthropic-wif-jwt-boundary.mjs
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: anthropic-wif-environment-subject-branch
+          path: evidence/
+          if-no-files-found: error
+
+  environment:
+    if: ${{ inputs.context == 'environment' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: h1-wif-env
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Environment-subject WIF exchange
+        env:
+          INPUT_AUDIENCE: ${{ inputs.audience }}
+          INPUT_EXPERIMENT: replay_same_jti
+          RUN_EXCHANGE: true
+          ANTHROPIC_ORGANIZATION_ID: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          ANTHROPIC_WORKSPACE_ID: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+          ANTHROPIC_FEDERATION_RULE_ID: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          H1_HANDLE: cyclopesy
+        run: node scripts/anthropic-wif-jwt-boundary.mjs
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: anthropic-wif-environment-subject-environment
+          path: evidence/
+          if-no-files-found: error
