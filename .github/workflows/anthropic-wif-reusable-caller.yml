@@ -1,0 +1,19 @@
+name: Anthropic WIF reusable caller
+
+on:
+  workflow_dispatch:
+    inputs:
+      audience:
+        description: "OIDC audience to request from GitHub"
+        required: true
+        default: "https://api.anthropic.com"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  call:
+    uses: ./.github/workflows/anthropic-wif-reusable-callee.yml
+    with:
+      audience: ${{ inputs.audience }}
