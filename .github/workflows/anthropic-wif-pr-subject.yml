@@ -1,0 +1,48 @@
+name: Anthropic WIF PR subject
+
+on:
+  workflow_dispatch:
+    inputs:
+      audience:
+        description: "OIDC audience to request from GitHub"
+        required: true
+        default: "https://api.anthropic.com"
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: WIF exchange from current GitHub OIDC context
+        env:
+          INPUT_AUDIENCE: ${{ github.event_name == 'workflow_dispatch' && inputs.audience || 'https://api.anthropic.com' }}
+          INPUT_EXPERIMENT: replay_same_jti
+          RUN_EXCHANGE: true
+          ANTHROPIC_ORGANIZATION_ID: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          ANTHROPIC_WORKSPACE_ID: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+          ANTHROPIC_FEDERATION_RULE_ID: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          H1_HANDLE: cyclopesy
+        run: node scripts/anthropic-wif-jwt-boundary.mjs
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: anthropic-wif-pr-subject-${{ github.event_name }}
+          path: evidence/
+          if-no-files-found: error
